@@ -139,6 +139,7 @@
 #include "image/lv_lodepng.h"
 #include "image/lv_image_decoder.h"
 #include "image/lv_svg.h"
+#include "image/lv_stb_image.h"
 #include "image/lv_tjpgd.h"
 #include "indev/lv_gridnav.h"
 #include "indev/lv_indev.h"

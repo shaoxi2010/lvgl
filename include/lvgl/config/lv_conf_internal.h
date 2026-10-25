@@ -1871,6 +1871,130 @@
     #endif
 #endif
 
+#ifndef LV_USE_STB_IMAGE
+    #ifdef CONFIG_LV_USE_STB_IMAGE
+        #define LV_USE_STB_IMAGE CONFIG_LV_USE_STB_IMAGE
+    #else
+        #define LV_USE_STB_IMAGE 0
+    #endif
+#endif
+
+#ifndef LV_STB_IMAGE_JPEG
+    #ifdef LV_KCONFIG_PRESENT
+        #ifdef CONFIG_LV_STB_IMAGE_JPEG
+            #define LV_STB_IMAGE_JPEG CONFIG_LV_STB_IMAGE_JPEG
+        #else
+            #define LV_STB_IMAGE_JPEG 0
+        #endif
+    #else
+          #define LV_STB_IMAGE_JPEG LV_USE_STB_IMAGE
+    #endif
+#endif
+
+#ifndef LV_STB_IMAGE_PNG
+    #ifdef LV_KCONFIG_PRESENT
+        #ifdef CONFIG_LV_STB_IMAGE_PNG
+            #define LV_STB_IMAGE_PNG CONFIG_LV_STB_IMAGE_PNG
+        #else
+            #define LV_STB_IMAGE_PNG 0
+        #endif
+    #else
+          #define LV_STB_IMAGE_PNG LV_USE_STB_IMAGE
+    #endif
+#endif
+
+#ifndef LV_STB_IMAGE_BMP
+    #ifdef LV_KCONFIG_PRESENT
+        #ifdef CONFIG_LV_STB_IMAGE_BMP
+            #define LV_STB_IMAGE_BMP CONFIG_LV_STB_IMAGE_BMP
+        #else
+            #define LV_STB_IMAGE_BMP 0
+        #endif
+    #else
+          #define LV_STB_IMAGE_BMP LV_USE_STB_IMAGE
+    #endif
+#endif
+
+#ifndef LV_STB_IMAGE_GIF
+    #ifdef LV_KCONFIG_PRESENT
+        #ifdef CONFIG_LV_STB_IMAGE_GIF
+            #define LV_STB_IMAGE_GIF CONFIG_LV_STB_IMAGE_GIF
+        #else
+            #define LV_STB_IMAGE_GIF 0
+        #endif
+    #else
+          #define LV_STB_IMAGE_GIF LV_USE_STB_IMAGE
+    #endif
+#endif
+
+#ifndef LV_STB_IMAGE_PSD
+    #ifdef LV_KCONFIG_PRESENT
+        #ifdef CONFIG_LV_STB_IMAGE_PSD
+            #define LV_STB_IMAGE_PSD CONFIG_LV_STB_IMAGE_PSD
+        #else
+            #define LV_STB_IMAGE_PSD 0
+        #endif
+    #else
+          #define LV_STB_IMAGE_PSD LV_USE_STB_IMAGE
+    #endif
+#endif
+
+#ifndef LV_STB_IMAGE_PIC
+    #ifdef LV_KCONFIG_PRESENT
+        #ifdef CONFIG_LV_STB_IMAGE_PIC
+            #define LV_STB_IMAGE_PIC CONFIG_LV_STB_IMAGE_PIC
+        #else
+            #define LV_STB_IMAGE_PIC 0
+        #endif
+    #else
+          #define LV_STB_IMAGE_PIC LV_USE_STB_IMAGE
+    #endif
+#endif
+
+#ifndef LV_STB_IMAGE_PNM
+    #ifdef LV_KCONFIG_PRESENT
+        #ifdef CONFIG_LV_STB_IMAGE_PNM
+            #define LV_STB_IMAGE_PNM CONFIG_LV_STB_IMAGE_PNM
+        #else
+            #define LV_STB_IMAGE_PNM 0
+        #endif
+    #else
+          #define LV_STB_IMAGE_PNM LV_USE_STB_IMAGE
+    #endif
+#endif
+
+#ifndef LV_STB_IMAGE_HDR
+    #ifdef LV_KCONFIG_PRESENT
+        #ifdef CONFIG_LV_STB_IMAGE_HDR
+            #define LV_STB_IMAGE_HDR CONFIG_LV_STB_IMAGE_HDR
+        #else
+            #define LV_STB_IMAGE_HDR 0
+        #endif
+    #else
+          #define LV_STB_IMAGE_HDR LV_USE_STB_IMAGE
+    #endif
+#endif
+
+#ifndef LV_STB_IMAGE_TGA
+    #ifdef LV_KCONFIG_PRESENT
+        #ifdef CONFIG_LV_STB_IMAGE_TGA
+            #define LV_STB_IMAGE_TGA CONFIG_LV_STB_IMAGE_TGA
+        #else
+            #define LV_STB_IMAGE_TGA 0
+        #endif
+    #else
+          #define LV_STB_IMAGE_TGA LV_USE_STB_IMAGE
+    #endif
+#endif
+
+#ifndef LV_STB_IMAGE_SIMD
+    #ifdef CONFIG_LV_STB_IMAGE_SIMD
+        #define LV_STB_IMAGE_SIMD CONFIG_LV_STB_IMAGE_SIMD
+    #else
+        #define LV_STB_IMAGE_SIMD LV_STB_IMAGE_SIMD_SCALAR
+    #endif
+#endif
+
 #ifndef LV_USE_SVG
     #ifdef CONFIG_LV_USE_SVG
         #define LV_USE_SVG CONFIG_LV_USE_SVG

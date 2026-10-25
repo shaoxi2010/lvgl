@@ -1584,6 +1584,77 @@ config LV_USE_LIBJPEG_TURBO
 config LV_USE_LIBWEBP
 	bool "WebP decoder"
 
+config LV_USE_STB_IMAGE
+	bool "Image decoder (stb_image)"
+	help
+		JPEG/PNG/BMP/GIF/PSD/PNM/TGA decoder based on the bundled stb_image.
+		SIMD paths are enabled automatically per target: SSE2 on x86/x64,
+		NEON on ARM, RVV on RISC-V. Define STBI_NO_SIMD to force scalar code.
+		Stb_image acts as a fallback: if another decoder (LodePNG, TJpgDec,
+		...) is also enabled and claims the format first, that one wins.
+
+if LV_USE_STB_IMAGE
+config LV_STB_IMAGE_JPEG
+	bool "JPEG"
+	default y
+
+config LV_STB_IMAGE_PNG
+	bool "PNG"
+	default y
+
+config LV_STB_IMAGE_BMP
+	bool "BMP"
+	default y
+
+config LV_STB_IMAGE_GIF
+	bool "GIF (first frame only)"
+	default y
+
+config LV_STB_IMAGE_PSD
+	bool "PSD"
+	default y
+
+config LV_STB_IMAGE_PIC
+	bool "PIC (Softimage)"
+	default y
+
+config LV_STB_IMAGE_PNM
+	bool "PNM (binary PGM/PPM)"
+	default y
+
+config LV_STB_IMAGE_HDR
+	bool "HDR (radiance)"
+	default y
+
+config LV_STB_IMAGE_TGA
+	bool "TGA"
+	default y
+
+choice LV_STB_IMAGE_SIMD
+	prompt "SIMD acceleration"
+	default LV_STB_IMAGE_SIMD_SCALAR
+	help
+		Nothing is enabled automatically. Each choice only takes effect when
+		it matches the target architecture and compiler flags; a mismatch
+		falls back to scalar code with a compile-time warning.
+
+	config LV_STB_IMAGE_SIMD_SCALAR
+		bool "None (scalar)"
+	config LV_STB_IMAGE_SIMD_SSE2
+		bool "SSE2 (x86/x64)"
+	config LV_STB_IMAGE_SIMD_NEON
+		bool "NEON (ARM)"
+		help
+			Requires building with NEON enabled, e.g. -mfpu=neon.
+	config LV_STB_IMAGE_SIMD_RVV
+		bool "RVV (RISC-V)"
+		help
+			Supports RVV 1.0 toolchains, and RVV 0.7.1 with legacy
+			toolchains (-D__riscv_vector_071). Requires building with the
+			vector extension, e.g. -march=rv64gcv.
+endchoice
+endif #LV_USE_STB_IMAGE
+
 config LV_USE_SVG
 	bool "SVG"
 	depends on LV_DRAW_HAS_VECTOR_SUPPORT

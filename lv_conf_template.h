@@ -929,6 +929,55 @@
 /** WebP decoder */
 #define LV_USE_LIBWEBP 0
 
+/** JPEG/PNG/BMP/GIF/PSD/PNM/TGA decoder based on the bundled stb_image.
+ *  SIMD paths are enabled automatically per target: SSE2 on x86/x64,
+ *  NEON on ARM, RVV on RISC-V. Define STBI_NO_SIMD to force scalar code.
+ *  Stb_image acts as a fallback: if another decoder (LodePNG, TJpgDec,
+ *  ...) is also enabled and claims the format first, that one wins.
+ */
+#define LV_USE_STB_IMAGE 0
+
+#if LV_USE_STB_IMAGE
+/** JPEG */
+#define LV_STB_IMAGE_JPEG 1
+
+/** PNG */
+#define LV_STB_IMAGE_PNG 1
+
+/** BMP */
+#define LV_STB_IMAGE_BMP 1
+
+/** GIF (first frame only) */
+#define LV_STB_IMAGE_GIF 1
+
+/** PSD */
+#define LV_STB_IMAGE_PSD 1
+
+/** PIC (Softimage) */
+#define LV_STB_IMAGE_PIC 1
+
+/** PNM (binary PGM/PPM) */
+#define LV_STB_IMAGE_PNM 1
+
+/** HDR (radiance) */
+#define LV_STB_IMAGE_HDR 1
+
+/** TGA */
+#define LV_STB_IMAGE_TGA 1
+
+/** Nothing is enabled automatically. Each choice only takes effect when
+ *  it matches the target architecture and compiler flags; a mismatch
+ *  falls back to scalar code with a compile-time warning.
+ *  Possible values:
+ *  - LV_STB_IMAGE_SIMD_SCALAR: None (scalar)
+ *  - LV_STB_IMAGE_SIMD_SSE2: SSE2 (x86/x64)
+ *  - LV_STB_IMAGE_SIMD_NEON: NEON (ARM)
+ *  - LV_STB_IMAGE_SIMD_RVV: RVV (RISC-V)
+ */
+#define LV_STB_IMAGE_SIMD LV_STB_IMAGE_SIMD_SCALAR
+
+#endif /*LV_USE_STB_IMAGE*/
+
 /** SVG
  *
  *  Enable: LV_USE_VECTOR_GRAPHIC

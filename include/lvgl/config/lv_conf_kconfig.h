@@ -61,6 +61,19 @@ extern "C" {
 #endif
 
 /*******************
+ * LV_STB_IMAGE_SIMD
+ *******************/
+#ifdef CONFIG_LV_STB_IMAGE_SIMD_SCALAR
+#  define CONFIG_LV_STB_IMAGE_SIMD LV_STB_IMAGE_SIMD_SCALAR
+#elif defined(CONFIG_LV_STB_IMAGE_SIMD_SSE2)
+#  define CONFIG_LV_STB_IMAGE_SIMD LV_STB_IMAGE_SIMD_SSE2
+#elif defined(CONFIG_LV_STB_IMAGE_SIMD_NEON)
+#  define CONFIG_LV_STB_IMAGE_SIMD LV_STB_IMAGE_SIMD_NEON
+#elif defined(CONFIG_LV_STB_IMAGE_SIMD_RVV)
+#  define CONFIG_LV_STB_IMAGE_SIMD LV_STB_IMAGE_SIMD_RVV
+#endif
+
+/*******************
  * LV_TXT_ENC
  *******************/
 #ifdef CONFIG_LV_TXT_ENC_UTF8

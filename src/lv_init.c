@@ -386,6 +386,10 @@ void lv_init(void)
     lv_libwebp_init();
 #endif
 
+#if LV_USE_STB_IMAGE
+    lv_stb_image_init();
+#endif
+
 #if LV_USE_BMP
     lv_bmp_init();
 #endif

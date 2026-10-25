@@ -106,6 +106,64 @@ extern "C" {
     } while(0)
 
 /**********************
+ *  RGB565 DESTINATION BLEND MACROS
+ *
+ *  Blend pre-extracted source components (R5, G6, B5 - i.e. already in
+ *  RGB565 component scale) into an RGB565 destination vector with a
+ *  per-pixel mix factor (u16m2, 0..255).
+ *
+ *  Formula per channel: x = src_c * mix + dst_c * (255 - mix)
+ *  The >> 8 division and the channel placement are fused into shift+mask:
+ *    R: (x << 3) & 0xF800  == ((x >> 8) & 0x1F) << 11   (x <= 0x1EE1, no overflow)
+ *    G: (x >> 3) & 0x07E0  == ((x >> 8) & 0x3F) << 5
+ *    B: x >> 8
+ **********************/
+
+/* Extract the R5, G6, B5 components of an RGB565 destination vector */
+#define LV_RVV_565_EXTRACT_U16M2(v_565, v_r5, v_g6, v_b5, vl) \
+    do { \
+        (v_r5) = __riscv_vsrl_vx_u16m2((v_565), 11, (vl)); \
+        (v_g6) = __riscv_vand_vx_u16m2(__riscv_vsrl_vx_u16m2((v_565), 5, (vl)), 0x3F, (vl)); \
+        (v_b5) = __riscv_vand_vx_u16m2((v_565), 0x1F, (vl)); \
+    } while(0)
+
+/* Blend source components into an RGB565 destination (no special cases) */
+#define LV_RVV_BLEND_565_U16M2(v_src_r5, v_src_g6, v_src_b5, v_dst565, v_mix16, v_out565, vl) \
+    do { \
+        vuint16m2_t _dst_r5, _dst_g6, _dst_b5; \
+        LV_RVV_565_EXTRACT_U16M2((v_dst565), _dst_r5, _dst_g6, _dst_b5, (vl)); \
+        vuint16m2_t _mix_inv = __riscv_vrsub_vx_u16m2((v_mix16), 255, (vl)); \
+        vuint16m2_t _x_r = __riscv_vadd_vv_u16m2(__riscv_vmul_vv_u16m2((v_src_r5), (v_mix16), (vl)), \
+                                                 __riscv_vmul_vv_u16m2(_dst_r5, _mix_inv, (vl)), (vl)); \
+        vuint16m2_t _x_g = __riscv_vadd_vv_u16m2(__riscv_vmul_vv_u16m2((v_src_g6), (v_mix16), (vl)), \
+                                                 __riscv_vmul_vv_u16m2(_dst_g6, _mix_inv, (vl)), (vl)); \
+        vuint16m2_t _x_b = __riscv_vadd_vv_u16m2(__riscv_vmul_vv_u16m2((v_src_b5), (v_mix16), (vl)), \
+                                                 __riscv_vmul_vv_u16m2(_dst_b5, _mix_inv, (vl)), (vl)); \
+        vuint16m2_t _res_r = __riscv_vand_vx_u16m2(__riscv_vsll_vx_u16m2(_x_r, 3, (vl)), 0xF800, (vl)); \
+        vuint16m2_t _res_g = __riscv_vand_vx_u16m2(__riscv_vsrl_vx_u16m2(_x_g, 3, (vl)), 0x07E0, (vl)); \
+        vuint16m2_t _res_b = __riscv_vsrl_vx_u16m2(_x_b, 8, (vl)); \
+        (v_out565) = __riscv_vor_vv_u16m2(__riscv_vor_vv_u16m2(_res_r, _res_g, (vl)), _res_b, (vl)); \
+    } while(0)
+
+/* Select exact results for the trivial mix values:
+ * mix == 0 -> destination, mix >= 255 -> source */
+#define LV_RVV_BLEND_565_SELECT_U16M2(v_out565, v_src565, v_dst565, v_mix16, vl) \
+    do { \
+        vbool8_t _zero_mask = __riscv_vmseq_vx_u16m2_b8((v_mix16), 0, (vl)); \
+        vbool8_t _full_mask = __riscv_vmsgeu_vx_u16m2_b8((v_mix16), LV_OPA_MAX, (vl)); \
+        (v_out565) = __riscv_vmerge_vvm_u16m2((v_out565), (v_dst565), _zero_mask, (vl)); \
+        (v_out565) = __riscv_vmerge_vvm_u16m2((v_out565), (v_src565), _full_mask, (vl)); \
+    } while(0)
+
+/* Same-color shortcut for RGB565-on-RGB565 blends: the >> 8 of the mix formula
+ * can round a channel down by 1 even when src == dst, so take src verbatim */
+#define LV_RVV_BLEND_565_SELECT_EQ_U16M2(v_out565, v_src565, v_dst565, vl) \
+    do { \
+        vbool8_t _eq_mask = __riscv_vmseq_vv_u16m2_b8((v_src565), (v_dst565), (vl)); \
+        (v_out565) = __riscv_vmerge_vvm_u16m2((v_out565), (v_src565), _eq_mask, (vl)); \
+    } while(0)
+
+/**********************
  *  ALPHA BLENDING MACROS
  *
  *  Standard blend formula: result = (src * alpha + dst * (255 - alpha)) >> 8

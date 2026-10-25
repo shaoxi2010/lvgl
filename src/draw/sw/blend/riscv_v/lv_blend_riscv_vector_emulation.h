@@ -110,6 +110,11 @@ typedef struct {
     size_t vl;
 } vuint8m8_t;
 
+typedef struct {
+    uint16_t data[64];  /* 1024 bits / 16 bits per element = 64 elements */
+    size_t vl;
+} vuint16m8_t;
+
 /* Boolean/mask types (vbool4 means SEW/LMUL=4, for e8m2 -> 8/2=4) */
 typedef struct {
     uint8_t data[32];   /* Same size as the vector it masks (e8m2 = 32 elements) */
@@ -178,6 +183,11 @@ static inline size_t __riscv_vsetvlmax_e8m8(void)
     return 128;    /* 1024/8 = 128 */
 }
 
+static inline size_t __riscv_vsetvlmax_e16m8(void)
+{
+    return 64;    /* 1024/16 = 64 */
+}
+
 static inline size_t __riscv_vsetvlmax_e64m1(void)
 {
     return 2;    /* 128/64 = 2 */
@@ -244,6 +254,11 @@ static inline size_t __riscv_vsetvl_e8m8(size_t avl)
     return avl > 128 ? 128 : avl;
 }
 
+static inline size_t __riscv_vsetvl_e16m8(size_t avl)
+{
+    return avl > 64 ? 64 : avl;
+}
+
 /* ============================================================================
  * Vector Initialize Operations (vmv.v.x - broadcast)
  * ============================================================================
@@ -286,6 +301,16 @@ static inline vuint16m4_t __riscv_vmv_v_x_u16m4(uint16_t src, size_t vl)
 {
     vuint16m4_t res;
     res.vl = vl > 32 ? 32 : vl;
+    for(size_t i = 0; i < res.vl; i++) {
+        res.data[i] = src;
+    }
+    return res;
+}
+
+static inline vuint16m8_t __riscv_vmv_v_x_u16m8(uint16_t src, size_t vl)
+{
+    vuint16m8_t res;
+    res.vl = vl > 64 ? 64 : vl;
     for(size_t i = 0; i < res.vl; i++) {
         res.data[i] = src;
     }
@@ -454,6 +479,13 @@ static inline void __riscv_vse16_v_u16m4(uint16_t * base, vuint16m4_t v, size_t 
     }
 }
 
+static inline void __riscv_vse16_v_u16m8(uint16_t * base, vuint16m8_t v, size_t vl)
+{
+    for(size_t i = 0; i < v.vl && i < vl; i++) {
+        base[i] = v.data[i];
+    }
+}
+
 /**
  * vsse16: Store 16-bit vector with stride
  */
@@ -498,6 +530,33 @@ static inline vuint16m2_t __riscv_vmul_vv_u16m2(vuint16m2_t v1, vuint16m2_t v2, 
     res.vl = v1.vl;
     for(size_t i = 0; i < v1.vl && i < vl; i++) {
         res.data[i] = v1.data[i] * v2.data[i];
+    }
+    return res;
+}
+
+/**
+ * vmulhu: Vector multiply high-half unsigned (scalar * vector)
+ * Returns the high 16 bits of the 16x16 -> 32-bit unsigned product
+ */
+static inline vuint16m2_t __riscv_vmulhu_vx_u16m2(vuint16m2_t v, uint16_t x, size_t vl)
+{
+    vuint16m2_t res;
+    res.vl = v.vl;
+    for(size_t i = 0; i < v.vl && i < vl; i++) {
+        res.data[i] = (uint16_t)(((uint32_t)v.data[i] * (uint32_t)x) >> 16);
+    }
+    return res;
+}
+
+/**
+ * vminu: Vector minimum unsigned (scalar * vector)
+ */
+static inline vuint16m2_t __riscv_vminu_vx_u16m2(vuint16m2_t v, uint16_t x, size_t vl)
+{
+    vuint16m2_t res;
+    res.vl = v.vl;
+    for(size_t i = 0; i < v.vl && i < vl; i++) {
+        res.data[i] = v.data[i] < x ? v.data[i] : x;
     }
     return res;
 }
@@ -592,6 +651,19 @@ static inline vuint16m4_t __riscv_vwmaccu_vv_u16m4(vuint16m4_t acc, vuint8m2_t v
 static inline vuint16m2_t __riscv_vsrl_vx_u16m2(vuint16m2_t v, uint32_t x, size_t vl)
 {
     vuint16m2_t res;
+    res.vl = v.vl;
+    for(size_t i = 0; i < v.vl && i < vl; i++) {
+        res.data[i] = v.data[i] >> x;
+    }
+    return res;
+}
+
+/**
+ * vsrl: Vector shift right logical (8-bit, scalar shift amount)
+ */
+static inline vuint8m1_t __riscv_vsrl_vx_u8m1(vuint8m1_t v, uint32_t x, size_t vl)
+{
+    vuint8m1_t res;
     res.vl = v.vl;
     for(size_t i = 0; i < v.vl && i < vl; i++) {
         res.data[i] = v.data[i] >> x;
@@ -712,6 +784,47 @@ static inline vbool4_t __riscv_vmseq_vx_u8m2_b4(vuint8m2_t v, uint8_t x, size_t 
 }
 
 /**
+ * vmseq: Vector equal comparison (scalar, u16m2 -> vbool8)
+ * Returns boolean mask (1 if equal, 0 if not)
+ */
+static inline vbool8_t __riscv_vmseq_vx_u16m2_b8(vuint16m2_t v, uint16_t x, size_t vl)
+{
+    vbool8_t res;
+    res.vl = v.vl;
+    for(size_t i = 0; i < v.vl && i < vl; i++) {
+        res.data[i] = (v.data[i] == x) ? 1 : 0;
+    }
+    return res;
+}
+
+/**
+ * vmseq: Vector equal comparison (vector, u16m2 -> vbool8)
+ */
+static inline vbool8_t __riscv_vmseq_vv_u16m2_b8(vuint16m2_t v1, vuint16m2_t v2, size_t vl)
+{
+    vbool8_t res;
+    res.vl = v1.vl;
+    for(size_t i = 0; i < v1.vl && i < vl; i++) {
+        res.data[i] = (v1.data[i] == v2.data[i]) ? 1 : 0;
+    }
+    return res;
+}
+
+/**
+ * vmsgeu: Vector greater or equal comparison (scalar, u16m2 -> vbool8)
+ * Returns boolean mask
+ */
+static inline vbool8_t __riscv_vmsgeu_vx_u16m2_b8(vuint16m2_t v, uint16_t x, size_t vl)
+{
+    vbool8_t res;
+    res.vl = v.vl;
+    for(size_t i = 0; i < v.vl && i < vl; i++) {
+        res.data[i] = (v.data[i] >= x) ? 1 : 0;
+    }
+    return res;
+}
+
+/**
  * vmsgeu: Vector greater or equal comparison (scalar)
  * Returns boolean mask
  */
@@ -733,6 +846,46 @@ static inline vbool4_t __riscv_vmsgeu_vx_u8m2_b4(vuint8m2_t v, uint8_t x, size_t
         res.data[i] = (v.data[i] >= x) ? 1 : 0;
     }
     return res;
+}
+
+/**
+ * vmsgtu: Vector greater-than unsigned comparison (scalar)
+ * Returns boolean mask (1 if v > x)
+ */
+static inline vbool8_t __riscv_vmsgtu_vx_u8m1_b8(vuint8m1_t v, uint8_t x, size_t vl)
+{
+    vbool8_t res;
+    res.vl = v.vl;
+    for(size_t i = 0; i < v.vl && i < vl; i++) {
+        res.data[i] = (v.data[i] > x) ? 1 : 0;
+    }
+    return res;
+}
+
+/**
+ * vmsltu: Vector less-than unsigned comparison (scalar)
+ * Returns boolean mask (1 if v < x)
+ */
+static inline vbool8_t __riscv_vmsltu_vx_u8m1_b8(vuint8m1_t v, uint8_t x, size_t vl)
+{
+    vbool8_t res;
+    res.vl = v.vl;
+    for(size_t i = 0; i < v.vl && i < vl; i++) {
+        res.data[i] = (v.data[i] < x) ? 1 : 0;
+    }
+    return res;
+}
+
+/**
+ * vfirst: Find the first set bit in the mask
+ * Returns the index of the lowest set element, or -1 if no element is set
+ */
+static inline long __riscv_vfirst_m_b8(vbool8_t mask, size_t vl)
+{
+    for(size_t i = 0; i < mask.vl && i < vl; i++) {
+        if(mask.data[i]) return (long)i;
+    }
+    return -1;
 }
 
 /* ============================================================================
@@ -784,6 +937,20 @@ static inline vuint8m2_t __riscv_vmerge_vxm_u8m2(vuint8m2_t v, uint8_t x, vbool4
     res.vl = v.vl;
     for(size_t i = 0; i < v.vl && i < vl; i++) {
         res.data[i] = mask.data[i] ? x : v.data[i];
+    }
+    return res;
+}
+
+/**
+ * vmerge: Merge vector under predicate mask (u16m2)
+ * Result = mask ? v2 : v1
+ */
+static inline vuint16m2_t __riscv_vmerge_vvm_u16m2(vuint16m2_t v1, vuint16m2_t v2, vbool8_t mask, size_t vl)
+{
+    vuint16m2_t res;
+    res.vl = v1.vl;
+    for(size_t i = 0; i < v1.vl && i < vl; i++) {
+        res.data[i] = mask.data[i] ? v2.data[i] : v1.data[i];
     }
     return res;
 }
@@ -852,6 +1019,16 @@ static inline vuint16m2_t __riscv_vadd_vx_u16m2(vuint16m2_t v, uint16_t x, size_
     res.vl = v.vl;
     for(size_t i = 0; i < v.vl && i < vl; i++) {
         res.data[i] = v.data[i] + x;
+    }
+    return res;
+}
+
+static inline vuint16m2_t __riscv_vadd_vv_u16m2(vuint16m2_t v1, vuint16m2_t v2, size_t vl)
+{
+    vuint16m2_t res;
+    res.vl = v1.vl;
+    for(size_t i = 0; i < v1.vl && i < vl; i++) {
+        res.data[i] = v1.data[i] + v2.data[i];
     }
     return res;
 }

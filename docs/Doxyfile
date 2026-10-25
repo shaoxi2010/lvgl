@@ -2244,6 +2244,7 @@ PREDEFINED             = DOXYGEN                         \
                          LV_USE_THEME_DEFAULT=1          \
                          LV_USE_THEME_MONO=1             \
                          LV_USE_THEME_SIMPLE=1           \
+                         LV_USE_TSLIB=1                  \
                          LV_USE_THORVG=1                 \
                          LV_USE_THORVG_EXTERNAL=1        \
                          LV_USE_THORVG_INTERNAL=1        \

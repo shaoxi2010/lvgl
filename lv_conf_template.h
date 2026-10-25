@@ -1896,6 +1896,9 @@
 
 #endif /*LV_USE_SDL*/
 
+/** Read touch input through tslib. tslib must be available in the build. The touchscreen has to be configured for tslib, e.g. via `ts_uenv`. */
+#define LV_USE_TSLIB 0
+
 /** Display and input drivers for UEFI firmware, based on the Graphics Output, keyboard and pointer protocols. */
 #define LV_USE_UEFI 0
 

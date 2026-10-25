@@ -1,0 +1,83 @@
+---
+title: tslib
+description: "The tslib driver reads touch input through tslib, which applies filtering and calibration to resistive and other noisy touchscreens."
+---
+
+## Overview
+
+[tslib](https://github.com/libts/tslib) is a touch screen library that sits between the raw kernel events
+and the application. Its filter chain (median,dejitter, linear...) smooths noisy samples and applies the
+calibration produced by `ts_calibrate`, which makes it especially useful for older resistive touch panels.
+
+Compared with [evdev](/integration/embedded_linux/drivers/evdev), tslib adds this filtering and calibration
+layer but only supports touch (no mouse or keyboard) and no automatic device discovery. Use evdev for a
+clean modern touchscreen; use tslib when your panel is noisy or you already run tslib on the system.
+
+### Prerequisites
+
+tslib must be available in the build (usually the `libts-dev`/`libts0` package, or a from-source install).
+
+The touchscreen has to be configured for tslib: the `TSLIB_TSDEVICE`, `TSLIB_CONFFILE`, `TSLIB_CALIBFILE`,
+`TSLIB_PLUGINDIR` and `TSLIB_FBDEVICE` environment variables must point at the right files. Recent tslib
+versions print them for you:
+
+```bash
+. /usr/bin/ts_uenv
+```
+
+Calibrate the panel once with `ts_calibrate`, which writes `TSLIB_CALIBFILE` (`/etc/pointercal` by default).
+Verify the setup with `ts_test`.
+
+## Configuration
+
+Enable <ApiLink name="LV_USE_TSLIB" />.
+
+tslib reads its filter chain from `TSLIB_CONFFILE` (`/etc/ts.conf` by default), so there are no
+LVGL-level filter options.
+
+## Building
+
+The driver requires `tslib` (`-lts`). LVGL's CMake integration resolves it through pkg-config, where the
+module is named `tslib` on most systems and `ts` on some older installations; both are tried.
+
+## Usage
+
+Call <ApiLink name="lv_tslib_create" /> with the device node path. It creates a pointer input device, so
+attach it to a display with <ApiLink name="lv_indev_set_display" />:
+
+```c
+lv_indev_t * touch = lv_tslib_create("/dev/input/event0");
+lv_indev_set_display(touch, disp);
+```
+
+<ApiLink name="lv_tslib_delete" /> removes the device again.
+
+### Calibration and axis swap
+
+Because tslib already applies the calibration from `ts_calibrate`, the driver passes its coordinates
+through unchanged. Two knobs are still available for screens that need them:
+
+- <ApiLink name="lv_tslib_set_swap_axes" /> swaps the x and y axes.
+- <ApiLink name="lv_tslib_set_calibration" /> maps a raw coordinate range onto the display, like
+  [evdev](/integration/embedded_linux/drivers/evdev) does. Leave it alone unless tslib runs without
+  the linear calibration filter.
+
+## Support
+
+| Capability | Value |
+|---|---|
+| Device types | Touchscreen (pointer) |
+| Automatic discovery | No |
+| Hotplug | No |
+| Full keyboard (layouts, modifiers) | No |
+| Touch calibration | Through tslib (`ts_calibrate` + `ts.conf`), or <ApiLink name="lv_tslib_set_calibration" /> |
+| Axis swap | <ApiLink name="lv_tslib_set_swap_axes" /> |
+| Find device by capability | No |
+| BSD | Yes, where tslib is available |
+
+## See Also
+
+- [evdev](/integration/embedded_linux/drivers/evdev) - lighter alternative with discovery and hotplug
+- [libinput](/integration/embedded_linux/drivers/libinput) - desktop input stack with quirk handling
+- [Linux Framebuffer](/integration/embedded_linux/drivers/fbdev) - display driver commonly paired with tslib
+- [Dependency Management](/integration/building/cmake) - how LVGL resolves tslib

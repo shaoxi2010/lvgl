@@ -3805,6 +3805,14 @@
     #endif
 #endif
 
+#ifndef LV_USE_TSLIB
+    #ifdef CONFIG_LV_USE_TSLIB
+        #define LV_USE_TSLIB CONFIG_LV_USE_TSLIB
+    #else
+        #define LV_USE_TSLIB 0
+    #endif
+#endif
+
 #ifndef LV_USE_UEFI
     #ifdef CONFIG_LV_USE_UEFI
         #define LV_USE_UEFI CONFIG_LV_USE_UEFI

@@ -51,6 +51,7 @@ custom platform integration, and off-screen rendering with no display server at 
 |---|---|---|---|---|---|
 | **[evdev](/integration/embedded_linux/drivers/evdev)** | The common case — a known touchscreen or mouse | Yes | No | Yes | No |
 | **[libinput](/integration/embedded_linux/drivers/libinput)** | Text entry, or devices needing quirks | No | Yes, via XKB | Not needed | Yes |
+| **[tslib](/integration/embedded_linux/drivers/tslib)** | Noisy panels needing filtering and calibration | No | No | Through tslib | No |
 
 Use **evdev** unless you need real keyboard support — layouts and modifiers — or your device requires
 libinput's quirk handling. evdev is lighter and is the only one of the two with automatic device discovery and

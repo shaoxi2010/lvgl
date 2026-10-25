@@ -9,6 +9,7 @@
     "opengl_driver",
     "egl",
     "evdev",
-    "libinput"
+    "libinput",
+    "tslib"
   ]
 }

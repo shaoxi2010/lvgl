@@ -89,6 +89,7 @@
 #include "drivers/display/lv_tft_espi.h"
 #include "drivers/indev/lv_evdev.h"
 #include "drivers/indev/lv_libinput.h"
+#include "drivers/indev/lv_tslib.h"
 #include "drivers/indev/lv_xkb.h"
 #include "drivers/nuttx/lv_nuttx_entry.h"
 #include "drivers/nuttx/lv_nuttx_fbdev.h"

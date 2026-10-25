@@ -1,0 +1,5 @@
+config LV_USE_TSLIB
+	bool "tslib"
+	default n
+	help
+		Read touch input through tslib. tslib must be available in the build. The touchscreen has to be configured for tslib, e.g. via `ts_uenv`.

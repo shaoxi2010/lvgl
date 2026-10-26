@@ -123,7 +123,6 @@ static void fs_skip_cb(void * user, int n);
 static int fs_eof_cb(void * user);
 static void get_fs_callbacks(stbi_io_callbacks * cb);
 static bool is_stb_image(const uint8_t * raw_data, size_t len);
-static void copy_rgba_to_bgra(const uint8_t * src, lv_draw_buf_t * dst);
 
 /**********************
  *  STATIC VARIABLES
@@ -146,6 +145,11 @@ void lv_stb_image_init(void)
     lv_image_decoder_set_info_cb(dec, decoder_info);
     lv_image_decoder_set_open_cb(dec, decoder_open);
     lv_image_decoder_set_close_cb(dec, decoder_close);
+
+    /*LVGL's in-memory order is B,G,R(,A) (little-endian 0xAARRGGBB etc.),
+     *so make every stb decoder emit that order; the SIMD kernels swap the
+     *channels for free at the store*/
+    stbi_set_output_order(STBI_ORDER_BGR);
 
     dec->name = DECODER_NAME;
 }
@@ -227,7 +231,9 @@ static lv_result_t decoder_info(lv_image_decoder_t * decoder, lv_image_decoder_d
     /*Avoid attempting to load images LVGL cannot use*/
     if(w <= 0 || h <= 0 || w > UINT16_MAX || h > UINT16_MAX) return LV_RESULT_INVALID;
 
-    header->cf = LV_COLOR_FORMAT_ARGB8888;
+    /*images with an alpha channel decode to ARGB8888, everything else
+     *(JPEG, 24-bit BMP/PNG, ...) to RGB888*/
+    header->cf = (comp == 4) ? LV_COLOR_FORMAT_ARGB8888 : LV_COLOR_FORMAT_RGB888;
     header->w = w;
     header->h = h;
 
@@ -245,52 +251,60 @@ static lv_result_t decoder_open(lv_image_decoder_t * decoder, lv_image_decoder_d
     LV_UNUSED(decoder);
     LV_PROFILER_DECODER_BEGIN_TAG("lv_stb_decoder_open");
 
-    stbi_uc * raw = NULL;
     int w, h, comp;
-    lv_fs_file_t f;
-    bool file_opened = false;
+    lv_draw_buf_t * decoded = NULL;
 
+    /*Read the header to size the draw buffer, then decode straight into it:
+     *JPEG writes its rows in place, every other format is row-copied in by
+     *stb itself -- either way no adapter-side copy*/
     if(dsc->src_type == LV_IMAGE_SRC_FILE) {
-        lv_fs_res_t res = lv_fs_open(&f, dsc->src, LV_FS_MODE_RD);
-        if(res != LV_FS_RES_OK) {
-            LV_LOG_WARN("File open failed: %d", (int)res);
+        lv_fs_file_t f;
+        if(lv_fs_open(&f, dsc->src, LV_FS_MODE_RD) != LV_FS_RES_OK) {
+            LV_LOG_WARN("File open failed");
             LV_PROFILER_DECODER_END_TAG("lv_stb_decoder_open");
             return LV_RESULT_INVALID;
         }
-        file_opened = true;
 
         stbi_io_callbacks cb;
         get_fs_callbacks(&cb);
-        raw = stbi_load_from_callbacks(&cb, &f, &w, &h, &comp, 4);
+        if(stbi_info_from_callbacks(&cb, &f, &w, &h, &comp) && w > 0 && h > 0) {
+            decoded = lv_draw_buf_create(w, h, (comp == 4) ? LV_COLOR_FORMAT_ARGB8888 : LV_COLOR_FORMAT_RGB888, 0);
+            if(decoded) {
+                int req = (comp == 4) ? 4 : 3;
+                lv_fs_seek(&f, 0, LV_FS_SEEK_SET);
+                if(stbi_load_from_callbacks_into(&cb, &f, decoded->data, (int)decoded->header.stride,
+                                                 &w, &h, &comp, req) == NULL) {
+                    lv_draw_buf_destroy(decoded);
+                    decoded = NULL;
+                }
+            }
+        }
+        lv_fs_close(&f);
     }
     else if(dsc->src_type == LV_IMAGE_SRC_VARIABLE) {
         const lv_image_dsc_t * img_dsc = dsc->src;
-        raw = stbi_load_from_memory(img_dsc->data, (int)img_dsc->data_size, &w, &h, &comp, 4);
+        if(stbi_info_from_memory(img_dsc->data, (int)img_dsc->data_size, &w, &h, &comp) && w > 0 && h > 0) {
+            decoded = lv_draw_buf_create(w, h, (comp == 4) ? LV_COLOR_FORMAT_ARGB8888 : LV_COLOR_FORMAT_RGB888, 0);
+            if(decoded) {
+                int req = (comp == 4) ? 4 : 3;
+                if(stbi_load_from_memory_into(img_dsc->data, (int)img_dsc->data_size, decoded->data,
+                                              (int)decoded->header.stride, &w, &h, &comp, req) == NULL) {
+                    lv_draw_buf_destroy(decoded);
+                    decoded = NULL;
+                }
+            }
+        }
     }
     else {
         LV_PROFILER_DECODER_END_TAG("lv_stb_decoder_open");
         return LV_RESULT_INVALID;
     }
 
-    if(file_opened) lv_fs_close(&f);
-
-    if(raw == NULL) {
+    if(decoded == NULL) {
         LV_LOG_WARN("stb_image error: %s", stbi_failure_reason());
         LV_PROFILER_DECODER_END_TAG("lv_stb_decoder_open");
         return LV_RESULT_INVALID;
     }
-
-    /*Decode the image into a draw buffer as BGRA8888, keeping the draw buffer's stride*/
-    lv_draw_buf_t * decoded = lv_draw_buf_create(w, h, LV_COLOR_FORMAT_ARGB8888, 0);
-    if(decoded == NULL) {
-        LV_LOG_WARN("Failed to allocate draw buffer");
-        stbi_image_free(raw);
-        LV_PROFILER_DECODER_END_TAG("lv_stb_decoder_open");
-        return LV_RESULT_INVALID;
-    }
-
-    copy_rgba_to_bgra(raw, decoded);
-    stbi_image_free(raw);
 
     lv_draw_buf_t * adjusted = lv_image_decoder_post_process(dsc, decoded);
     if(adjusted == NULL) {
@@ -432,29 +446,6 @@ static bool is_stb_image(const uint8_t * raw_data, size_t len)
 #endif
 
     return false;
-}
-
-/**
- * Copy the stb_image RGBA8888 output into a draw buffer, converting it to
- * LVGL's BGRA8888 subpixel order on the fly.
- * @param src       the RGBA8888 image data returned by stb, w * h * 4 bytes, tightly packed
- * @param dst       the destination draw buffer with its own stride
- */
-static void copy_rgba_to_bgra(const uint8_t * src, lv_draw_buf_t * dst)
-{
-    uint32_t w = dst->header.w;
-    uint32_t stride = dst->header.stride;
-
-    for(uint32_t y = 0; y < dst->header.h; y++) {
-        lv_color32_t * dst_row = (lv_color32_t *)((uint8_t *)dst->data + y * stride);
-        const uint8_t * src_row = src + y * w * 4;
-        for(uint32_t x = 0; x < w; x++) {
-            dst_row[x].red   = src_row[x * 4 + 0];
-            dst_row[x].green = src_row[x * 4 + 1];
-            dst_row[x].blue  = src_row[x * 4 + 2];
-            dst_row[x].alpha = src_row[x * 4 + 3];
-        }
-    }
 }
 
 #endif /*LV_USE_STB_IMAGE*/

@@ -94,7 +94,7 @@
 #include "draw/sw/blend/sve2/lv_sve2_util.h"
 #include "draw/sw/blend/riscv_v/lv_blend_riscv_v.h"
 #include "draw/sw/blend/riscv_v/lv_blend_riscv_v_private.h"
-#include "draw/sw/blend/riscv_v/lv_blend_riscv_vector_emulation.h"
+#include "draw/sw/blend/riscv_v/lv_draw_sw_blend_riscv_v_to_rgb565.h"
 #include "draw/sw/blend/riscv_v/lv_draw_sw_blend_riscv_v_to_rgb888.h"
 #include "draw/sw/lv_draw_sw.h"
 #include "draw/sw/lv_draw_sw_grad.h"

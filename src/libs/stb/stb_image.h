@@ -44,6 +44,12 @@
    This copy carries the RISC-V Vector (RVV) accelerated JPEG IDCT and PNG
    paths from the stb_image fork in opencv-mobile (https://github.com/nihui/opencv-mobile),
    with further local modifications. Enable the RVV paths by defining STBI_RVV.
+   Output channel order is runtime-adjustable with stbi_set_output_order():
+   STBI_ORDER_BGR writes B,G,R(,A) instead of R,G,B(,A) — the byte order of
+   LVGL RGB888 (B,G,R) and little-endian ARGB8888 (0xAARRGGBB = B,G,R,A
+   bytes). It governs every decoder (JPEG kernels, the convert_format path
+   of PNG/BMP/TGA/... and the rgb565 packers), not just JPEG; the SIMD
+   kernels reorder channels for free at the store.
 
 
 LICENSE
@@ -429,6 +435,23 @@ STBIDEF stbi_uc *stbi_load_from_callbacks(stbi_io_callbacks const *clbk  , void 
 // decode any supported format to packed rgb565 (2 bytes per pixel)
 STBIDEF stbi_uc *stbi_load_rgb565_from_memory(stbi_uc const *buffer, int len, int *x, int *y, int *channels_in_file);
 
+// runtime-adjustable output channel order, honoured by every decoder;
+// STBI_ORDER_BGR writes B,G,R(,A), e.g. LVGL's little-endian RGB888 and
+// ARGB8888 layouts. default is native stb order R,G,B(,A)
+enum
+{
+   STBI_ORDER_RGB = 0,
+   STBI_ORDER_BGR = 1,
+};
+
+STBIDEF void stbi_set_output_order(int order);
+
+// decode straight into a caller-provided buffer with row pitch
+// out_stride_bytes (>= desired_channels * width). jpeg writes into
+// out_buffer directly, other formats decode packed and row-copy in.
+// desired_channels also accepts STBI_rgb565
+STBIDEF stbi_uc *stbi_load_from_callbacks_into(stbi_io_callbacks const *clbk, void *user, stbi_uc *out_buffer, int out_stride_bytes, int *x, int *y, int *channels_in_file, int desired_channels);
+STBIDEF stbi_uc *stbi_load_from_memory_into   (stbi_uc const *buffer, int len, stbi_uc *out_buffer, int out_stride_bytes, int *x, int *y, int *channels_in_file, int desired_channels);
 #ifndef STBI_NO_STDIO
 STBIDEF stbi_uc *stbi_load_rgb565          (char const *filename, int *x, int *y, int *channels_in_file);
 STBIDEF stbi_uc *stbi_load_rgb565_from_file(FILE *f, int *x, int *y, int *channels_in_file);
@@ -675,6 +698,14 @@ typedef unsigned char validate_uint32[sizeof(stbi__uint32)==4 ? 1 : -1];
 #define STBI_HAS_LROTL
 #endif
 
+// runtime output channel order; read by every decoder path
+static int stbi__output_order = STBI_ORDER_RGB;
+
+STBIDEF void stbi_set_output_order(int order)
+{
+   stbi__output_order = (order == STBI_ORDER_BGR) ? STBI_ORDER_BGR : STBI_ORDER_RGB;
+}
+
 #ifdef STBI_HAS_LROTL
    #define stbi_lrot(x,y)  _lrotl(x,y)
 #else
@@ -917,11 +948,8 @@ static void stbi__rewind(stbi__context *s)
    s->img_buffer_end = s->img_buffer_original_end;
 }
 
-enum
-{
-   STBI_ORDER_RGB,
-   STBI_ORDER_BGR
-};
+// STBI_ORDER_RGB / STBI_ORDER_BGR live in the public enum next to
+// stbi_set_output_order() in the header section above
 
 typedef struct
 {
@@ -930,9 +958,12 @@ typedef struct
    int channel_order;
 } stbi__result_info;
 
+static stbi_uc *stbi__load_rgb565(stbi__context *s, int *x, int *y, int *channels_in_file);
+
 #ifndef STBI_NO_JPEG
 static int      stbi__jpeg_test(stbi__context *s);
 static void    *stbi__jpeg_load(stbi__context *s, int *x, int *y, int *comp, int req_comp, stbi__result_info *ri);
+static stbi_uc *stbi__jpeg_load_into(stbi__context *s, stbi_uc *into, int into_stride, int *x, int *y, int *comp, int req_comp);
 static int      stbi__jpeg_info(stbi__context *s, int *x, int *y, int *comp);
 #endif
 
@@ -1298,6 +1329,19 @@ static unsigned char *stbi__load_and_postprocess_8bit(stbi__context *s, int *x, 
       ri.bits_per_channel = 8;
    }
 
+   // honour stbi__output_order; the jpeg kernels already reordered and
+   // flagged ri.channel_order, grayscale has no order to swap
+   if (stbi__output_order == STBI_ORDER_BGR && ri.channel_order != STBI_ORDER_BGR) {
+      int channels = req_comp ? req_comp : *comp;
+      if (channels >= 3) {
+         size_t i, px = (size_t)*x * (size_t)*y;
+         stbi_uc *q = (stbi_uc *) result;
+         for (i = 0; i < px; ++i, q += channels) {
+            stbi_uc t = q[0]; q[0] = q[2]; q[2] = t;
+         }
+      }
+   }
+
    // @TODO: move stbi__convert_format to here
 
    if (stbi__vertically_flip_on_load) {
@@ -1463,6 +1507,57 @@ STBIDEF stbi_uc *stbi_load_from_callbacks(stbi_io_callbacks const *clbk, void *u
    stbi__context s;
    stbi__start_callbacks(&s, (stbi_io_callbacks *) clbk, user);
    return stbi__load_and_postprocess_8bit(&s,x,y,comp,req_comp);
+}
+
+// _into core: jpeg decodes straight into the caller's buffer, everything
+// else decodes packed and gets row-copied in
+static stbi_uc *stbi__load_into(stbi__context *s, stbi_uc *out, int out_stride,
+                                int *x, int *y, int *comp, int req_comp)
+{
+   stbi_uc *result;
+   int channels;
+
+   #ifndef STBI_NO_JPEG
+   if (req_comp != STBI_rgb565 && stbi__jpeg_test(s)) {
+      result = stbi__jpeg_load_into(s, out, out_stride, x, y, comp, req_comp);
+      if (result == out) return out;
+      return NULL;
+   }
+   #endif
+
+   if (req_comp == STBI_rgb565)
+      result = stbi__load_rgb565(s, x, y, comp);
+   else
+      result = stbi__load_and_postprocess_8bit(s, x, y, comp, req_comp);
+   if (result == NULL) return NULL;
+
+   channels = (req_comp == STBI_rgb565) ? 2 : (req_comp ? req_comp : *comp);
+   if (out_stride < channels * *x) {
+      STBI_FREE(result);
+      return stbi__errpuc("bad stride", "out_stride too small for width");
+   }
+
+   {
+      int j;
+      for (j = 0; j < *y; ++j)
+         memcpy(out + (size_t)out_stride * j, result + (size_t)channels * *x * j, (size_t)channels * *x);
+   }
+   STBI_FREE(result);
+   return out;
+}
+
+STBIDEF stbi_uc *stbi_load_from_callbacks_into(stbi_io_callbacks const *clbk, void *user, stbi_uc *out_buffer, int out_stride_bytes, int *x, int *y, int *channels_in_file, int desired_channels)
+{
+   stbi__context s;
+   stbi__start_callbacks(&s, (stbi_io_callbacks *) clbk, user);
+   return stbi__load_into(&s, out_buffer, out_stride_bytes, x, y, channels_in_file, desired_channels);
+}
+
+STBIDEF stbi_uc *stbi_load_from_memory_into(stbi_uc const *buffer, int len, stbi_uc *out_buffer, int out_stride_bytes, int *x, int *y, int *channels_in_file, int desired_channels)
+{
+   stbi__context s;
+   stbi__start_mem(&s, buffer, len);
+   return stbi__load_into(&s, out_buffer, out_stride_bytes, x, y, channels_in_file, desired_channels);
 }
 
 #ifndef STBI_NO_GIF
@@ -1954,6 +2049,13 @@ static stbi_uc *stbi__hdr_to_ldr(float   *data, int x, int y, int comp)
 //      - fast huffman; reasonable integer IDCT
 //      - some SIMD kernels for common paths on targets with SSE2/NEON
 //      - uses a lot of intermediate memory, could cache poorly
+
+// rgb565 packing, honours stbi__output_order
+static unsigned short stbi__rgb565_pack(unsigned r, unsigned g, unsigned b)
+{
+   if (stbi__output_order == STBI_ORDER_BGR) { unsigned t = r; r = b; b = t; }
+   return (unsigned short)((r >> 3) << 11 | (g >> 2) << 5 | (b >> 3));
+}
 
 #ifndef STBI_NO_JPEG
 
@@ -4300,27 +4402,15 @@ static void stbi__YCbCr_to_RGB_row(stbi_uc *out, const stbi_uc *y, const stbi_uc
       if ((unsigned) r > 255) { if (r < 0) r = 0; else r = 255; }
       if ((unsigned) g > 255) { if (g < 0) g = 0; else g = 255; }
       if ((unsigned) b > 255) { if (b < 0) b = 0; else b = 255; }
-      out[0] = (stbi_uc)r;
-      out[1] = (stbi_uc)g;
-      out[2] = (stbi_uc)b;
+      if (stbi__output_order == STBI_ORDER_BGR) {
+         out[0] = (stbi_uc)b; out[1] = (stbi_uc)g; out[2] = (stbi_uc)r;
+      } else {
+         out[0] = (stbi_uc)r; out[1] = (stbi_uc)g; out[2] = (stbi_uc)b;
+      }
       out[3] = 255;
       out += step;
    }
 }
-
-// rgb565 packing helpers
-// STBI_RGB565_BGR       : swap r/b, for bgr565 panels
-// STBI_RGB565_BIGENDIAN : store high byte first, for spi lcd panels like st7789
-#ifndef STBI_RGB565_BGR
-#define stbi__rgb565_pack(r,g,b) ((unsigned short)(((unsigned)(r) >> 3) << 11 | ((unsigned)(g) >> 2) << 5 | ((unsigned)(b) >> 3)))
-#else
-#define stbi__rgb565_pack(r,g,b) ((unsigned short)(((unsigned)(b) >> 3) << 11 | ((unsigned)(g) >> 2) << 5 | ((unsigned)(r) >> 3)))
-#endif
-#ifdef STBI_RGB565_BIGENDIAN
-#define stbi__rgb565_swap(p) ((unsigned short)(((unsigned short)(p) >> 8) | ((unsigned short)(p) << 8)))
-#else
-#define stbi__rgb565_swap(p) ((unsigned short)(p))
-#endif
 
 static void stbi__YCbCr_to_RGB565_row(stbi_uc *out, const stbi_uc *y, const stbi_uc *pcb, const stbi_uc *pcr, int count)
 {
@@ -4340,7 +4430,7 @@ static void stbi__YCbCr_to_RGB565_row(stbi_uc *out, const stbi_uc *y, const stbi
       if ((unsigned) r > 255) { if (r < 0) r = 0; else r = 255; }
       if ((unsigned) g > 255) { if (g < 0) g = 0; else g = 255; }
       if ((unsigned) b > 255) { if (b < 0) b = 0; else b = 255; }
-      o[i] = stbi__rgb565_swap(stbi__rgb565_pack(r, g, b));
+      o[i] = stbi__rgb565_pack(r, g, b);
    }
 }
 
@@ -4443,9 +4533,16 @@ static void stbi__YCbCr_to_RGB_simd(stbi_uc *out, stbi_uc const *y, stbi_uc cons
 
          // undo scaling, round, convert to byte
          uint8x8x3_t o;
-         o.val[0] = vqrshrun_n_s16(rws, 4);
-         o.val[1] = vqrshrun_n_s16(gws, 4);
-         o.val[2] = vqrshrun_n_s16(bws, 4);
+         {
+            uint8x8_t rr_ = vqrshrun_n_s16(rws, 4);
+            uint8x8_t gg_ = vqrshrun_n_s16(gws, 4);
+            uint8x8_t bb_ = vqrshrun_n_s16(bws, 4);
+            if (stbi__output_order == STBI_ORDER_BGR) {
+               o.val[0] = bb_; o.val[1] = gg_; o.val[2] = rr_;
+            } else {
+               o.val[0] = rr_; o.val[1] = gg_; o.val[2] = bb_;
+            }
+         }
 
          // store, interleaving r/g/b
          vst3_u8(out, o);
@@ -4484,9 +4581,16 @@ static void stbi__YCbCr_to_RGB_simd(stbi_uc *out, stbi_uc const *y, stbi_uc cons
 
          // undo scaling, round, convert to byte
          uint8x8x4_t o;
-         o.val[0] = vqrshrun_n_s16(rws, 4);
-         o.val[1] = vqrshrun_n_s16(gws, 4);
-         o.val[2] = vqrshrun_n_s16(bws, 4);
+         {
+            uint8x8_t rr_ = vqrshrun_n_s16(rws, 4);
+            uint8x8_t gg_ = vqrshrun_n_s16(gws, 4);
+            uint8x8_t bb_ = vqrshrun_n_s16(bws, 4);
+            if (stbi__output_order == STBI_ORDER_BGR) {
+               o.val[0] = bb_; o.val[1] = gg_; o.val[2] = rr_;
+            } else {
+               o.val[0] = rr_; o.val[1] = gg_; o.val[2] = bb_;
+            }
+         }
          o.val[3] = vdup_n_u8(255);
 
          // store, interleaving r/g/b/a
@@ -4536,8 +4640,9 @@ static void stbi__YCbCr_to_RGB_simd(stbi_uc *out, stbi_uc const *y, stbi_uc cons
          vuint8m2_t gb = vnclipu_wx_u8m2(vreinterpret_v_i16m4_u16m4(vmax_vx_i16m4(vsra_vx_i16m4(gws, 4, vl), 0, vl)), 0, vl);
          vuint8m2_t bb = vnclipu_wx_u8m2(vreinterpret_v_i16m4_u16m4(vmax_vx_i16m4(vsra_vx_i16m4(bws, 4, vl), 0, vl)), 0, vl);
 
-         // store, interleaving r/g/b
-         vuint8m2x3_t o = vcreate_u8m2x3(rb, gb, bb);
+         // store, interleaving (bgr swaps r/b)
+         vuint8m2x3_t o = (stbi__output_order == STBI_ORDER_BGR)
+            ? vcreate_u8m2x3(bb, gb, rb) : vcreate_u8m2x3(rb, gb, bb);
          vsseg3e8_v_u8m2x3(out, o, vl);
 #else
          size_t vl = __riscv_vsetvl_e8m2(n);
@@ -4568,8 +4673,9 @@ static void stbi__YCbCr_to_RGB_simd(stbi_uc *out, stbi_uc const *y, stbi_uc cons
          vuint8m2_t gb = __riscv_vnsrl_wx_u8m2(__riscv_vand_vx_u16m4(__riscv_vminu_vx_u16m4(__riscv_vreinterpret_v_i16m4_u16m4(__riscv_vmax_vx_i16m4(gws, 0, vl)), 4095, vl), 0x0FF0, vl), 4, vl);
          vuint8m2_t bb = __riscv_vnsrl_wx_u8m2(__riscv_vand_vx_u16m4(__riscv_vminu_vx_u16m4(__riscv_vreinterpret_v_i16m4_u16m4(__riscv_vmax_vx_i16m4(bws, 0, vl)), 4095, vl), 0x0FF0, vl), 4, vl);
 
-         // store, interleaving r/g/b
-         vuint8m2x3_t o = __riscv_vcreate_v_u8m2x3(rb, gb, bb);
+         // store, interleaving (bgr swaps r/b)
+         vuint8m2x3_t o = (stbi__output_order == STBI_ORDER_BGR)
+            ? __riscv_vcreate_v_u8m2x3(bb, gb, rb) : __riscv_vcreate_v_u8m2x3(rb, gb, bb);
          __riscv_vsseg3e8_v_u8m2x3(out, o, vl);
 #endif
          out += vl*3;
@@ -4618,8 +4724,9 @@ static void stbi__YCbCr_to_RGB_simd(stbi_uc *out, stbi_uc const *y, stbi_uc cons
          vuint8m2_t bb = vnclipu_wx_u8m2(vreinterpret_v_i16m4_u16m4(vmax_vx_i16m4(vsra_vx_i16m4(bws, 4, vl), 0, vl)), 0, vl);
          vuint8m2_t ab = vmv_v_x_u8m2(255, vl);
 
-         // store, interleaving r/g/b/a
-         vuint8m2x4_t o = vcreate_u8m2x4(rb, gb, bb, ab);
+         // store, interleaving (bgr swaps r/b)
+         vuint8m2x4_t o = (stbi__output_order == STBI_ORDER_BGR)
+            ? vcreate_u8m2x4(bb, gb, rb, ab) : vcreate_u8m2x4(rb, gb, bb, ab);
          vsseg4e8_v_u8m2x4(out, o, vl);
 #else
          size_t vl = __riscv_vsetvl_e8m2(n);
@@ -4648,9 +4755,16 @@ static void stbi__YCbCr_to_RGB_simd(stbi_uc *out, stbi_uc const *y, stbi_uc cons
          vuint16m4_t g16 = __riscv_vminu_vx_u16m4(__riscv_vreinterpret_v_i16m4_u16m4(__riscv_vmax_vx_i16m4(gws, 0, vl)), 4095, vl);
          vuint16m4_t b16 = __riscv_vminu_vx_u16m4(__riscv_vreinterpret_v_i16m4_u16m4(__riscv_vmax_vx_i16m4(bws, 0, vl)), 4095, vl);
 
-         // pack r|g and b|a pairs, interleave into u32, store as RGBA
-         vuint16m4_t rg16 = __riscv_vor_vv_u16m4(__riscv_vsrl_vx_u16m4(r16, 4, vl), __riscv_vand_vx_u16m4(__riscv_vsll_vx_u16m4(g16, 4, vl), 0xFF00, vl), vl);
-         vuint16m4_t ba16 = __riscv_vor_vv_u16m4(__riscv_vsrl_vx_u16m4(b16, 4, vl), __riscv_vmv_v_x_u16m4(0xFF00, vl), vl);
+         // pack r|g and b|a pairs into u32 (bgr swaps the pairs)
+         vuint16m4_t fp16 = __riscv_vsrl_vx_u16m4(r16, 4, vl);
+         vuint16m4_t sp16 = __riscv_vsrl_vx_u16m4(b16, 4, vl);
+         if (stbi__output_order == STBI_ORDER_BGR) {
+            vuint16m4_t t16 = fp16; fp16 = sp16; sp16 = t16;
+         }
+         vuint16m4_t rg16 = __riscv_vor_vv_u16m4(fp16,
+                                                 __riscv_vand_vx_u16m4(__riscv_vsll_vx_u16m4(g16, 4, vl), 0xFF00, vl), vl);
+         vuint16m4_t ba16 = __riscv_vor_vv_u16m4(sp16,
+                                                 __riscv_vmv_v_x_u16m4(0xFF00, vl), vl);
          vuint32m8_t rgba32 = __riscv_vwmaccu_vx_u32m8(__riscv_vwaddu_vv_u32m8(rg16, ba16, vl), 0xFFFF, ba16, vl);
          __riscv_vse32_v_u32m8((stbi__uint32 *)out, rgba32, vl);
 #endif
@@ -4676,9 +4790,11 @@ static void stbi__YCbCr_to_RGB_simd(stbi_uc *out, stbi_uc const *y, stbi_uc cons
       if ((unsigned) r > 255) { if (r < 0) r = 0; else r = 255; }
       if ((unsigned) g > 255) { if (g < 0) g = 0; else g = 255; }
       if ((unsigned) b > 255) { if (b < 0) b = 0; else b = 255; }
-      out[0] = (stbi_uc)r;
-      out[1] = (stbi_uc)g;
-      out[2] = (stbi_uc)b;
+      if (stbi__output_order == STBI_ORDER_BGR) {
+         out[0] = (stbi_uc)b; out[1] = (stbi_uc)g; out[2] = (stbi_uc)r;
+      } else {
+         out[0] = (stbi_uc)r; out[1] = (stbi_uc)g; out[2] = (stbi_uc)b;
+      }
       out[3] = 255;
       out += step;
    }
@@ -4732,22 +4848,19 @@ static void stbi__YCbCr_to_RGB565_simd(stbi_uc *out, stbi_uc const *y, stbi_uc c
       vuint8m2_t gb = vnclipu_wx_u8m2(vreinterpret_v_i16m4_u16m4(vmax_vx_i16m4(vsra_vx_i16m4(gws, 4, vl), 0, vl)), 0, vl);
       vuint8m2_t bb = vnclipu_wx_u8m2(vreinterpret_v_i16m4_u16m4(vmax_vx_i16m4(vsra_vx_i16m4(bws, 4, vl), 0, vl)), 0, vl);
 
-      // pack r5 g6 b5 into one u16 per pixel
+      // pack r5 g6 b5 (bgr swaps which of r/b takes the high bits)
       vuint16m4_t r16 = vwcvtu_x_x_v_u16m4(rb, vl);
       vuint16m4_t g16 = vwcvtu_x_x_v_u16m4(gb, vl);
       vuint16m4_t b16 = vwcvtu_x_x_v_u16m4(bb, vl);
-#ifdef STBI_RGB565_BGR
-      vuint16m4_t p565 = vsll_vx_u16m4(vsrl_vx_u16m4(b16, 3, vl), 11, vl);
+      vuint16m4_t hi16 = vsll_vx_u16m4(vsrl_vx_u16m4(r16, 3, vl), 11, vl);
+      vuint16m4_t lo16 = vsrl_vx_u16m4(b16, 3, vl);
+      if (stbi__output_order == STBI_ORDER_BGR) {
+         hi16 = vsll_vx_u16m4(vsrl_vx_u16m4(b16, 3, vl), 11, vl);
+         lo16 = vsrl_vx_u16m4(r16, 3, vl);
+      }
+      vuint16m4_t p565 = hi16;
       p565 = vor_vv_u16m4(p565, vsll_vx_u16m4(vsrl_vx_u16m4(g16, 2, vl), 5, vl), vl);
-      p565 = vor_vv_u16m4(p565, vsrl_vx_u16m4(r16, 3, vl), vl);
-#else
-      vuint16m4_t p565 = vsll_vx_u16m4(vsrl_vx_u16m4(r16, 3, vl), 11, vl);
-      p565 = vor_vv_u16m4(p565, vsll_vx_u16m4(vsrl_vx_u16m4(g16, 2, vl), 5, vl), vl);
-      p565 = vor_vv_u16m4(p565, vsrl_vx_u16m4(b16, 3, vl), vl);
-#endif
-#ifdef STBI_RGB565_BIGENDIAN
-      p565 = vor_vv_u16m4(vsrl_vx_u16m4(p565, 8, vl), vsll_vx_u16m4(p565, 8, vl), vl);
-#endif
+      p565 = vor_vv_u16m4(p565, lo16, vl);
       vse16_v_u16m4((unsigned short *)out + i, p565, vl);
 #else
       size_t vl = __riscv_vsetvl_e8m2(n);
@@ -4778,19 +4891,16 @@ static void stbi__YCbCr_to_RGB565_simd(stbi_uc *out, stbi_uc const *y, stbi_uc c
       vuint16m4_t g16 = __riscv_vminu_vx_u16m4(__riscv_vreinterpret_v_i16m4_u16m4(__riscv_vmax_vx_i16m4(gws, 0, vl)), 4095, vl);
       vuint16m4_t b16 = __riscv_vminu_vx_u16m4(__riscv_vreinterpret_v_i16m4_u16m4(__riscv_vmax_vx_i16m4(bws, 0, vl)), 4095, vl);
 
-      // pack r5 g6 b5; 8-bit values sit in bits [11:4]
-#ifdef STBI_RGB565_BGR
-      vuint16m4_t p565 = __riscv_vsll_vx_u16m4(__riscv_vand_vx_u16m4(b16, 0x0F80, vl), 4, vl);
+      // pack r5 g6 b5; values sit in bits [11:4] (bgr swaps r/b)
+      vuint16m4_t hi16 = __riscv_vsll_vx_u16m4(__riscv_vand_vx_u16m4(r16, 0x0F80, vl), 4, vl);
+      vuint16m4_t lo16 = __riscv_vsrl_vx_u16m4(b16, 7, vl);
+      if (stbi__output_order == STBI_ORDER_BGR) {
+         hi16 = __riscv_vsll_vx_u16m4(__riscv_vand_vx_u16m4(b16, 0x0F80, vl), 4, vl);
+         lo16 = __riscv_vsrl_vx_u16m4(r16, 7, vl);
+      }
+      vuint16m4_t p565 = hi16;
       p565 = __riscv_vor_vv_u16m4(p565, __riscv_vsrl_vx_u16m4(__riscv_vand_vx_u16m4(g16, 0x0FC0, vl), 1, vl), vl);
-      p565 = __riscv_vor_vv_u16m4(p565, __riscv_vsrl_vx_u16m4(r16, 7, vl), vl);
-#else
-      vuint16m4_t p565 = __riscv_vsll_vx_u16m4(__riscv_vand_vx_u16m4(r16, 0x0F80, vl), 4, vl);
-      p565 = __riscv_vor_vv_u16m4(p565, __riscv_vsrl_vx_u16m4(__riscv_vand_vx_u16m4(g16, 0x0FC0, vl), 1, vl), vl);
-      p565 = __riscv_vor_vv_u16m4(p565, __riscv_vsrl_vx_u16m4(b16, 7, vl), vl);
-#endif
-#ifdef STBI_RGB565_BIGENDIAN
-      p565 = __riscv_vor_vv_u16m4(__riscv_vsrl_vx_u16m4(p565, 8, vl), __riscv_vsll_vx_u16m4(p565, 8, vl), vl);
-#endif
+      p565 = __riscv_vor_vv_u16m4(p565, lo16, vl);
       __riscv_vse16_v_u16m4((unsigned short *)out, p565, vl);
 #endif
 
@@ -4818,7 +4928,9 @@ static void stbi__setup_jpeg(stbi__jpeg *j)
 #ifdef STBI_SSE2
    if (stbi__sse2_available()) {
       j->idct_block_kernel = stbi__idct_simd;
-      j->YCbCr_to_RGB_kernel = stbi__YCbCr_to_RGB_simd;
+      /*sse2 kernel ignores stbi__output_order, keep the scalar one*/
+      if (stbi__output_order == STBI_ORDER_RGB)
+         j->YCbCr_to_RGB_kernel = stbi__YCbCr_to_RGB_simd;
       j->resample_row_hv_2_kernel = stbi__resample_row_hv_2_simd;
    }
 #endif
@@ -4860,7 +4972,8 @@ static stbi_uc stbi__blinn_8x8(stbi_uc x, stbi_uc y)
    return (stbi_uc) ((t + (t >>8)) >> 8);
 }
 
-static stbi_uc *load_jpeg_image(stbi__jpeg *z, int *out_x, int *out_y, int *comp, int req_comp)
+static stbi_uc *load_jpeg_image(stbi__jpeg *z, int *out_x, int *out_y, int *comp, int req_comp,
+                                stbi_uc *into, int into_stride)
 {
    int n, decode_n, is_rgb;
    int rgb565 = (req_comp == STBI_rgb565);
@@ -4872,6 +4985,8 @@ static stbi_uc *load_jpeg_image(stbi__jpeg *z, int *out_x, int *out_y, int *comp
 
    // validate req_comp
    if (req_comp < 0 || req_comp > 4) return stbi__errpuc("bad req_comp", "Internal error");
+
+   if (into && rgb565) return stbi__errpuc("bad into", "direct buffer unsupported for rgb565"); // 8-bit unpacked only
 
    // load a jpeg image from whichever source, but leave in YCbCr format
    if (!stbi__decode_jpeg_image(z)) { stbi__cleanup_jpeg(z); return NULL; }
@@ -4898,6 +5013,7 @@ static stbi_uc *load_jpeg_image(stbi__jpeg *z, int *out_x, int *out_y, int *comp
    {
       int k;
       unsigned int i,j;
+      int row_off;
       stbi_uc *output;
       stbi_uc *coutput[4] = { NULL, NULL, NULL, NULL };
 
@@ -4926,12 +5042,20 @@ static stbi_uc *load_jpeg_image(stbi__jpeg *z, int *out_x, int *out_y, int *comp
       }
 
       // can't error after this so, this is safe
-      output = (stbi_uc *) stbi__malloc_mad3(n, z->s->img_x, z->s->img_y, 1);
-      if (!output) { stbi__cleanup_jpeg(z); return stbi__errpuc("outofmem", "Out of memory"); }
+      if (into) {
+         if (into_stride < n * z->s->img_x)
+            { stbi__cleanup_jpeg(z); return stbi__errpuc("bad stride", "into_stride too small for width"); }
+         output = into;
+         row_off = into_stride; // note: this path ignores stbi__vertically_flip_on_load
+      } else {
+         output = (stbi_uc *) stbi__malloc_mad3(n, z->s->img_x, z->s->img_y, 1);
+         if (!output) { stbi__cleanup_jpeg(z); return stbi__errpuc("outofmem", "Out of memory"); }
+         row_off = n * z->s->img_x;
+      }
 
       // now go ahead and resample
       for (j=0; j < z->s->img_y; ++j) {
-         stbi_uc *out = output + n * z->s->img_x * j;
+         stbi_uc *out = output + row_off * j;
          for (k=0; k < decode_n; ++k) {
             stbi__resample *r = &res_comp[k];
             int y_bot = r->ystep >= (r->vs >> 1);
@@ -4951,7 +5075,7 @@ static stbi_uc *load_jpeg_image(stbi__jpeg *z, int *out_x, int *out_y, int *comp
             if (z->s->img_n == 3) {
                if (is_rgb) {
                   for (i=0; i < z->s->img_x; ++i)
-                     ((unsigned short *)out)[i] = stbi__rgb565_swap(stbi__rgb565_pack(y[i], coutput[1][i], coutput[2][i]));
+                     ((unsigned short *)out)[i] = stbi__rgb565_pack(y[i], coutput[1][i], coutput[2][i]);
                } else {
                   z->YCbCr_to_RGB565_kernel(out, y, coutput[1], coutput[2], z->s->img_x);
                }
@@ -4961,14 +5085,14 @@ static stbi_uc *load_jpeg_image(stbi__jpeg *z, int *out_x, int *out_y, int *comp
                   stbi_uc r = stbi__blinn_8x8(coutput[0][i], m);
                   stbi_uc g = stbi__blinn_8x8(coutput[1][i], m);
                   stbi_uc b = stbi__blinn_8x8(coutput[2][i], m);
-                  ((unsigned short *)out)[i] = stbi__rgb565_swap(stbi__rgb565_pack(r, g, b));
+                  ((unsigned short *)out)[i] = stbi__rgb565_pack(r, g, b);
                }
             } else if (z->s->img_n == 4) { // YCCK / YCbCr+alpha, ignore the fourth channel
                z->YCbCr_to_RGB565_kernel(out, y, coutput[1], coutput[2], z->s->img_x);
             } else { // grayscale
                for (i=0; i < z->s->img_x; ++i) {
                   unsigned int v = y[i];
-                  ((unsigned short *)out)[i] = stbi__rgb565_swap(stbi__rgb565_pack(v, v, v));
+                  ((unsigned short *)out)[i] = stbi__rgb565_pack(v, v, v);
                }
             }
          } else if (n >= 3) {
@@ -4976,9 +5100,11 @@ static stbi_uc *load_jpeg_image(stbi__jpeg *z, int *out_x, int *out_y, int *comp
             if (z->s->img_n == 3) {
                if (is_rgb) {
                   for (i=0; i < z->s->img_x; ++i) {
-                     out[0] = y[i];
-                     out[1] = coutput[1][i];
-                     out[2] = coutput[2][i];
+                     if (stbi__output_order == STBI_ORDER_BGR) {
+                        out[0] = coutput[2][i]; out[1] = coutput[1][i]; out[2] = y[i];
+                     } else {
+                        out[0] = y[i]; out[1] = coutput[1][i]; out[2] = coutput[2][i];
+                     }
                      out[3] = 255;
                      out += n;
                   }
@@ -4989,9 +5115,14 @@ static stbi_uc *load_jpeg_image(stbi__jpeg *z, int *out_x, int *out_y, int *comp
                if (z->app14_color_transform == 0) { // CMYK
                   for (i=0; i < z->s->img_x; ++i) {
                      stbi_uc m = coutput[3][i];
-                     out[0] = stbi__blinn_8x8(coutput[0][i], m);
-                     out[1] = stbi__blinn_8x8(coutput[1][i], m);
-                     out[2] = stbi__blinn_8x8(coutput[2][i], m);
+                     stbi_uc r = stbi__blinn_8x8(coutput[0][i], m);
+                     stbi_uc g = stbi__blinn_8x8(coutput[1][i], m);
+                     stbi_uc b = stbi__blinn_8x8(coutput[2][i], m);
+                     if (stbi__output_order == STBI_ORDER_BGR) {
+                        out[0] = b; out[1] = g; out[2] = r;
+                     } else {
+                        out[0] = r; out[1] = g; out[2] = b;
+                     }
                      out[3] = 255;
                      out += n;
                   }
@@ -5066,10 +5197,28 @@ static void *stbi__jpeg_load(stbi__context *s, int *x, int *y, int *comp, int re
    STBI_NOTUSED(ri);
    j->s = s;
    stbi__setup_jpeg(j);
-   result = load_jpeg_image(j, x,y,comp,req_comp);
+   result = load_jpeg_image(j, x,y,comp,req_comp, NULL, 0);
+   if (result != NULL && ri != NULL && stbi__output_order == STBI_ORDER_BGR)
+      ri->channel_order = STBI_ORDER_BGR; // kernels already wrote B,G,R(,A); rgb565 passes ri=NULL
    STBI_FREE(j);
    return result;
 }
+
+static stbi_uc *stbi__jpeg_load_into(stbi__context *s, stbi_uc *into, int into_stride,
+                                     int *x, int *y, int *comp, int req_comp)
+{
+   unsigned char* result;
+   stbi__jpeg* j = (stbi__jpeg*) stbi__malloc(sizeof(stbi__jpeg));
+   if (!j) return stbi__errpuc("outofmem", "Out of memory");
+   memset(j, 0, sizeof(stbi__jpeg));
+   j->s = s;
+   stbi__setup_jpeg(j);
+   result = load_jpeg_image(j, x,y,comp,req_comp, into, into_stride);
+   STBI_FREE(j);
+   return result;
+}
+
+
 
 static int stbi__jpeg_test(stbi__context *s)
 {
@@ -5112,21 +5261,6 @@ static int stbi__jpeg_info(stbi__context *s, int *x, int *y, int *comp)
 #endif
 
 // decode any supported format to packed rgb565 (2 bytes per pixel)
-// the packing helpers live in the JPEG section above; redefine them for
-// builds that trim the JPEG decoder away
-#ifndef stbi__rgb565_pack
-#ifndef STBI_RGB565_BGR
-#define stbi__rgb565_pack(r,g,b) ((unsigned short)(((unsigned)(r) >> 3) << 11 | ((unsigned)(g) >> 2) << 5 | ((unsigned)(b) >> 3)))
-#else
-#define stbi__rgb565_pack(r,g,b) ((unsigned short)(((unsigned)(b) >> 3) << 11 | ((unsigned)(g) >> 2) << 5 | ((unsigned)(r) >> 3)))
-#endif
-#ifdef STBI_RGB565_BIGENDIAN
-#define stbi__rgb565_swap(p) ((unsigned short)(((unsigned short)(p) >> 8) | ((unsigned short)(p) << 8)))
-#else
-#define stbi__rgb565_swap(p) ((unsigned short)(p))
-#endif
-#endif
-
 static stbi_uc *stbi__load_rgb565(stbi__context *s, int *x, int *y, int *channels_in_file)
 {
    stbi_uc *rgb;
@@ -5144,8 +5278,15 @@ static stbi_uc *stbi__load_rgb565(stbi__context *s, int *x, int *y, int *channel
    if (rgb == NULL) return NULL;
 
    n = (*x) * (*y);
-   for (i = 0; i < n; ++i)
-      ((unsigned short *) rgb)[i] = stbi__rgb565_swap(stbi__rgb565_pack(rgb[i*3+0], rgb[i*3+1], rgb[i*3+2]));
+   if (stbi__output_order == STBI_ORDER_BGR) {
+      // postprocess already swapped to b,g,r; feed true r,g,b so the
+      // packer's swap still lands on bgr565
+      for (i = 0; i < n; ++i)
+         ((unsigned short *) rgb)[i] = stbi__rgb565_pack(rgb[i*3+2], rgb[i*3+1], rgb[i*3+0]);
+   } else {
+      for (i = 0; i < n; ++i)
+         ((unsigned short *) rgb)[i] = stbi__rgb565_pack(rgb[i*3+0], rgb[i*3+1], rgb[i*3+2]);
+   }
    return (stbi_uc *) STBI_REALLOC_SIZED(rgb, (size_t) n * 3, (size_t) n * 2);
 }
 

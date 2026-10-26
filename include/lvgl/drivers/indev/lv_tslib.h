@@ -56,6 +56,48 @@ void lv_tslib_set_swap_axes(lv_indev_t * indev, bool swap_axes);
 void lv_tslib_set_calibration(lv_indev_t * indev, int min_x, int min_y, int max_x, int max_y);
 
 /**
+ * Begin a touchscreen calibration sequence: pauses the indev feed and
+ * swallows a still-held touch (e.g. the long-press that opened the
+ * calibration UI). Sampling and UI stay separated: the application draws
+ * its own crosshair scene between these calls.
+ * @param indev tslib input device
+ */
+void lv_tslib_calibration_start(lv_indev_t * indev);
+
+/**
+ * Sample one raw (unfiltered) touch point: waits for a press (bounded by
+ * timeout_ms), collects samples until release, returns the median of each
+ * axis. Blocks; pumps lv_timer_handler() while waiting.
+ * @param indev        tslib input device, in a calibration sequence
+ * @param timeout_ms   give up when no touch within this time
+ * @param x            raw x result
+ * @param y            raw y result
+ * @return true: sampled; false: timed out
+ */
+bool lv_tslib_calibration_sample(lv_indev_t * indev, uint32_t timeout_ms, int * x, int * y);
+
+/**
+ * Fit the 5 sampled raw points to the 5 screen points the UI displayed
+ * (ts_calibrate-compatible least squares), write the result to
+ * $TSLIB_CALIBFILE (default /etc/pointercal) and reconfigure the filter
+ * stack, so the live device is recalibrated without a restart. Ends the
+ * calibration sequence.
+ * @param indev       tslib input device
+ * @param screen_pts  the 5 points the UI asked the user to touch
+ * @param raw_pts     the 5 raw points sampled at those locations
+ * @return LV_RESULT_OK: saved and applied; LV_RESULT_INVALID: fit or I/O error
+ */
+lv_result_t lv_tslib_calibration_finish(lv_indev_t * indev, const lv_point_t screen_pts[5],
+                                        const lv_point_t raw_pts[5]);
+
+/**
+ * Abandon the calibration sequence without saving (e.g. the UI timed out
+ * waiting for a point). Ends the sequence and resumes the indev feed.
+ * @param indev tslib input device
+ */
+void lv_tslib_calibration_cancel(lv_indev_t * indev);
+
+/**
  * Remove tslib input device.
  * @param indev tslib input device to close and free @nullable
  */

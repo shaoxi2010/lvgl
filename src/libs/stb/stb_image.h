@@ -50,6 +50,11 @@
    bytes). It governs every decoder (JPEG kernels, the convert_format path
    of PNG/BMP/TGA/... and the rgb565 packers), not just JPEG; the SIMD
    kernels reorder channels for free at the store.
+   The JPEG entropy decoder is restructured after libjpeg-turbo's jdhuff.c:
+   merged fast-table entries ((symbol<<8)|size in one load), a bit buffer
+   held in local variables across whole blocks/MCUs instead of the jpeg
+   struct, and a GET_BYTE-style refill loop that walks the io buffer with a
+   local cursor. Behavior and decoded output are bit-identical to upstream.
 
 
 LICENSE
@@ -2064,8 +2069,11 @@ static unsigned short stbi__rgb565_pack(unsigned r, unsigned g, unsigned b)
 
 typedef struct
 {
-   stbi_uc  fast[1 << FAST_BITS];
-   // weirdly, repacking this into AoS is a 10% speed loss, instead of a win
+   // merged fast-path entry (jdhuff-style derived table): (values[k] << 8) | size[k],
+   // so one load yields both the symbol and its code length. 0 = miss (a valid
+   // code always has size >= 1). Replaces the former 3-dependent-load chain
+   // fast[c] -> size[k] -> values[k].
+   stbi__uint16 fast[1 << FAST_BITS];
    stbi__uint16 code[256];
    stbi_uc  values[256];
    stbi_uc  size[257];
@@ -2158,19 +2166,34 @@ static int stbi__build_huffman(stbi__huffman *h, int *count)
    }
    h->maxcode[j] = 0xffffffff;
 
-   // build non-spec acceleration table; 255 is flag for not-accelerated
-   memset(h->fast, 255, 1 << FAST_BITS);
+   // build non-spec acceleration table; entries first hold the symbol-list
+   // index + 1 (0 = miss) because h->values is only filled from the DHT
+   // payload after this returns. stbi__merge_huffman_fast() then turns them
+   // into the merged (symbol<<8)|size form the decoder loads.
+   memset(h->fast, 0, sizeof(h->fast));
    for (i=0; i < k; ++i) {
       int s = h->size[i];
       if (s <= FAST_BITS) {
          int c = h->code[i] << (FAST_BITS-s);
          int m = 1 << (FAST_BITS-s);
          for (j=0; j < m; ++j) {
-            h->fast[c+j] = (stbi_uc) i;
+            h->fast[c+j] = (stbi__uint16) (i+1);
          }
       }
    }
    return 1;
+}
+
+// turn the index-based fast entries into merged (symbol<<8)|size entries;
+// must run after the DHT symbol list has been read into h->values
+static void stbi__merge_huffman_fast(stbi__huffman *h)
+{
+   int i;
+   for (i=0; i < (1 << FAST_BITS); ++i) {
+      stbi__uint16 e = h->fast[i];
+      if (e)
+         h->fast[i] = (stbi__uint16) ((h->values[e-1] << 8) + h->size[e-1]);
+   }
 }
 
 // build a table that decodes both magnitude and value of small ACs in
@@ -2179,13 +2202,13 @@ static void stbi__build_fast_ac(stbi__int16 *fast_ac, stbi__huffman *h)
 {
    int i;
    for (i=0; i < (1 << FAST_BITS); ++i) {
-      stbi_uc fast = h->fast[i];
+      stbi__uint16 fast = h->fast[i];
       fast_ac[i] = 0;
-      if (fast < 255) {
-         int rs = h->values[fast];
+      if (fast) {
+         int rs = fast >> 8;
          int run = (rs >> 4) & 15;
          int magbits = rs & 15;
-         int len = h->size[fast];
+         int len = fast & 255;
 
          if (magbits && len + magbits <= FAST_BITS) {
             // magnitude code followed by receive_extend code
@@ -2200,46 +2223,102 @@ static void stbi__build_fast_ac(stbi__int16 *fast_ac, stbi__huffman *h)
    }
 }
 
+// refill the bit buffer, jdhuff GET_BYTE style: the input cursor runs as a
+// local pointer over the io buffer so plain data bytes cost two loads and a
+// compare, without the per-byte img_buffer_end round-trip through
+// stbi__get8 (or the callback layer). FF handling falls back to the original
+// byte-at-a-time path, which also covers refill and end-of-input.
+stbi_inline static void stbi__grow_l(stbi__jpeg *j, stbi__uint32 *pcb, int *pnb)
+{
+   stbi__context *s = j->s;
+   stbi_uc *p = s->img_buffer;
+   stbi_uc *end = s->img_buffer_end;
+   stbi__uint32 cb = *pcb;
+   int nb = *pnb;
+
+   if (j->nomore) {
+      // out of data: the byte loop would fetch zeroes, so just top the
+      // counter up; the buffer itself stays untouched
+      while (nb <= 24)
+         nb += 8;
+   } else {
+      while (nb <= 24) {
+         unsigned int b;
+         if (p == end) {
+            if (!s->read_from_callbacks) {
+               // stbi__get8 would return 0 here; equivalent and cheaper
+               nb += 8;
+               continue;
+            }
+            s->img_buffer = p;
+            stbi__refill_buffer(s);
+            p = s->img_buffer;
+            end = s->img_buffer_end;
+            continue;
+         }
+         b = *p++;
+         if (b == 0xff) {
+            int c;
+            s->img_buffer = p;
+            c = stbi__get8(s);
+            while (c == 0xff) c = stbi__get8(s); // consume fill bytes
+            if (c != 0) {
+               j->marker = (unsigned char) c;
+               j->nomore = 1;
+               *pcb = cb;
+               *pnb = nb;
+               return;
+            }
+            p = s->img_buffer;
+            end = s->img_buffer_end;
+         }
+         cb |= b << (24 - nb);
+         nb += 8;
+      }
+   }
+
+   s->img_buffer = p;
+   *pcb = cb;
+   *pnb = nb;
+}
+
 static void stbi__grow_buffer_unsafe(stbi__jpeg *j)
 {
-   do {
-      unsigned int b = j->nomore ? 0 : stbi__get8(j->s);
-      if (b == 0xff) {
-         int c = stbi__get8(j->s);
-         while (c == 0xff) c = stbi__get8(j->s); // consume fill bytes
-         if (c != 0) {
-            j->marker = (unsigned char) c;
-            j->nomore = 1;
-            return;
-         }
-      }
-      j->code_buffer |= b << (24 - j->code_bits);
-      j->code_bits += 8;
-   } while (j->code_bits <= 24);
+   stbi__uint32 cb = j->code_buffer;
+   int nb = j->code_bits;
+   stbi__grow_l(j, &cb, &nb);
+   j->code_buffer = cb;
+   j->code_bits = nb;
 }
 
 // (1 << n) - 1
 static const stbi__uint32 stbi__bmask[17]={0,1,3,7,15,31,63,127,255,511,1023,2047,4095,8191,16383,32767,65535};
 
-// decode a jpeg huffman value from the bitstream
-stbi_inline static int stbi__jpeg_huff_decode(stbi__jpeg *j, stbi__huffman *h)
+// decode a jpeg huffman value from the bitstream. cb/nb are the caller's
+// register-resident copy of j->code_buffer/j->code_bits (jdhuff-style: the
+// bit state lives in locals for the whole block/MCU instead of being
+// reloaded from the jpeg struct for every symbol).
+stbi_inline static int stbi__jpeg_huff_decode_l(stbi__jpeg *j, stbi__huffman *h, stbi__uint32 *pcb, int *pnb)
 {
    unsigned int temp;
    int c,k;
+   stbi__uint32 cb = *pcb;
+   int nb = *pnb;
 
-   if (j->code_bits < 16) stbi__grow_buffer_unsafe(j);
+   if (nb < 16) stbi__grow_l(j, &cb, &nb);
 
    // look at the top FAST_BITS and determine what symbol ID it is,
-   // if the code is <= FAST_BITS
-   c = (j->code_buffer >> (32 - FAST_BITS)) & ((1 << FAST_BITS)-1);
+   // if the code is <= FAST_BITS. the merged entry carries symbol and
+   // code size in a single load.
+   c = (int)((cb >> (32 - FAST_BITS)) & ((1 << FAST_BITS)-1));
    k = h->fast[c];
-   if (k < 255) {
-      int s = h->size[k];
-      if (s > j->code_bits)
+   if (k) {
+      int s = k & 255;
+      if (s > nb)
          return -1;
-      j->code_buffer <<= s;
-      j->code_bits -= s;
-      return h->values[k];
+      *pcb = cb << s;
+      *pnb = nb - s;
+      return k >> 8;
    }
 
    // naive test is to shift the code_buffer down so k bits are
@@ -2248,29 +2327,40 @@ stbi_inline static int stbi__jpeg_huff_decode(stbi__jpeg *j, stbi__huffman *h)
    // end; in other words, regardless of the number of bits, it
    // wants to be compared against something shifted to have 16;
    // that way we don't need to shift inside the loop.
-   temp = j->code_buffer >> 16;
+   temp = cb >> 16;
    for (k=FAST_BITS+1 ; ; ++k)
       if (temp < h->maxcode[k])
          break;
    if (k == 17) {
       // error! code not found
-      j->code_bits -= 16;
+      *pnb = nb - 16;
       return -1;
    }
 
-   if (k > j->code_bits)
+   if (k > nb)
       return -1;
 
    // convert the huffman code to the symbol id
-   c = ((j->code_buffer >> (32 - k)) & stbi__bmask[k]) + h->delta[k];
+   c = ((cb >> (32 - k)) & stbi__bmask[k]) + h->delta[k];
    if(c < 0 || c >= 256) // symbol id out of bounds!
        return -1;
-   STBI_ASSERT((((j->code_buffer) >> (32 - h->size[c])) & stbi__bmask[h->size[c]]) == h->code[c]);
+   STBI_ASSERT(((cb >> (32 - h->size[c])) & stbi__bmask[h->size[c]]) == h->code[c]);
 
    // convert the id to a symbol
-   j->code_bits -= k;
-   j->code_buffer <<= k;
+   *pcb = cb << k;
+   *pnb = nb - k;
    return h->values[c];
+}
+
+// struct-backed variant for the paths that keep the bit state in j
+stbi_inline static int stbi__jpeg_huff_decode(stbi__jpeg *j, stbi__huffman *h)
+{
+   stbi__uint32 cb = j->code_buffer;
+   int nb = j->code_bits;
+   int r = stbi__jpeg_huff_decode_l(j, h, &cb, &nb);
+   j->code_buffer = cb;
+   j->code_bits = nb;
+   return r;
 }
 
 // bias[n] = (-1<<n) + 1
@@ -2278,19 +2368,36 @@ static const int stbi__jbias[16] = {0,-1,-3,-7,-15,-31,-63,-127,-255,-511,-1023,
 
 // combined JPEG 'receive' and JPEG 'extend', since baseline
 // always extends everything it receives.
-stbi_inline static int stbi__extend_receive(stbi__jpeg *j, int n)
+stbi_inline static int stbi__extend_receive_l(stbi__jpeg *j, int n, stbi__uint32 *pcb, int *pnb)
 {
    unsigned int k;
    int sgn;
-   if (j->code_bits < n) stbi__grow_buffer_unsafe(j);
-   if (j->code_bits < n) return 0; // ran out of bits from stream, return 0s intead of continuing
+   stbi__uint32 cb = *pcb;
+   int nb = *pnb;
 
-   sgn = j->code_buffer >> 31; // sign bit always in MSB; 0 if MSB clear (positive), 1 if MSB set (negative)
-   k = stbi_lrot(j->code_buffer, n);
-   j->code_buffer = k & ~stbi__bmask[n];
-   k &= stbi__bmask[n];
-   j->code_bits -= n;
-   return k + (stbi__jbias[n] & (sgn - 1));
+   if (nb < n) stbi__grow_l(j, &cb, &nb);
+   if (nb < n) return 0; // ran out of bits from stream, return 0s intead of continuing
+
+   sgn = (int)(cb >> 31); // sign bit always in MSB; 0 if MSB clear (positive), 1 if MSB set (negative)
+   // lrot split into two shifts: the rotated-away high bits are masked off by
+   // the consumer anyway, so cb << n is exactly the post-rotate buffer and
+   // cb >> (32-n) is exactly the n received bits — two short dependency
+   // chains instead of one rotate feeding both
+   k = cb >> (32 - n);
+   cb <<= n;
+   *pcb = cb;
+   *pnb = nb - n;
+   return (int)k + (stbi__jbias[n] & (sgn - 1));
+}
+
+stbi_inline static int stbi__extend_receive(stbi__jpeg *j, int n)
+{
+   stbi__uint32 cb = j->code_buffer;
+   int nb = j->code_bits;
+   int r = stbi__extend_receive_l(j, n, &cb, &nb);
+   j->code_buffer = cb;
+   j->code_bits = nb;
+   return r;
 }
 
 // get some unsigned bits
@@ -2334,24 +2441,38 @@ static const stbi_uc stbi__jpeg_dezigzag[64+15] =
    63, 63, 63, 63, 63, 63, 63
 };
 
-// decode one 64-entry block--
-static int stbi__jpeg_decode_block(stbi__jpeg *j, short data[64], stbi__huffman *hdc, stbi__huffman *hac, stbi__int16 *fac, int b, stbi__uint16 *dequant)
+// decode one 64-entry block--. pcb/pnb carry the bit state in/out so the
+// MCU loop can keep it in registers across blocks (jdhuff decode_mcu style);
+// they alias j->code_buffer/j->code_bits whenever the caller doesn't hold
+// its own copy.
+static int stbi__jpeg_decode_block(stbi__jpeg *j, short data[64], stbi__huffman *hdc, stbi__huffman *hac, stbi__int16 *fac, int b, stbi__uint16 *dequant, stbi__uint32 *pcb, int *pnb)
 {
    int diff,dc,k;
    int t;
+   stbi__uint32 cb = *pcb;
+   int nb = *pnb;
 
-   if (j->code_bits < 16) stbi__grow_buffer_unsafe(j);
-   t = stbi__jpeg_huff_decode(j, hdc);
-   if (t < 0 || t > 15) return stbi__err("bad huffman code","Corrupt JPEG");
+   // no grow here: huff_decode_l refills to >=16 bits itself
+   t = stbi__jpeg_huff_decode_l(j, hdc, &cb, &nb);
+   if (t < 0 || t > 15) {
+      *pcb = cb; *pnb = nb;
+      return stbi__err("bad huffman code","Corrupt JPEG");
+   }
 
    // 0 all the ac values now so we can do it 32-bits at a time
    memset(data,0,64*sizeof(data[0]));
 
-   diff = t ? stbi__extend_receive(j, t) : 0;
-   if (!stbi__addints_valid(j->img_comp[b].dc_pred, diff)) return stbi__err("bad delta","Corrupt JPEG");
+   diff = t ? stbi__extend_receive_l(j, t, &cb, &nb) : 0;
+   if (!stbi__addints_valid(j->img_comp[b].dc_pred, diff)) {
+      *pcb = cb; *pnb = nb;
+      return stbi__err("bad delta","Corrupt JPEG");
+   }
    dc = j->img_comp[b].dc_pred + diff;
    j->img_comp[b].dc_pred = dc;
-   if (!stbi__mul2shorts_valid(dc, dequant[0])) return stbi__err("can't merge dc and ac", "Corrupt JPEG");
+   if (!stbi__mul2shorts_valid(dc, dequant[0])) {
+      *pcb = cb; *pnb = nb;
+      return stbi__err("can't merge dc and ac", "Corrupt JPEG");
+   }
    data[0] = (short) (dc * dequant[0]);
 
    // decode AC components, see JPEG spec
@@ -2359,21 +2480,27 @@ static int stbi__jpeg_decode_block(stbi__jpeg *j, short data[64], stbi__huffman 
    do {
       unsigned int zig;
       int c,r,s;
-      if (j->code_bits < 16) stbi__grow_buffer_unsafe(j);
-      c = (j->code_buffer >> (32 - FAST_BITS)) & ((1 << FAST_BITS)-1);
+      if (nb < 16) stbi__grow_l(j, &cb, &nb);
+      c = (int)((cb >> (32 - FAST_BITS)) & ((1 << FAST_BITS)-1));
       r = fac[c];
       if (r) { // fast-AC path
          k += (r >> 4) & 15; // run
          s = r & 15; // combined length
-         if (s > j->code_bits) return stbi__err("bad huffman code", "Combined length longer than code bits available");
-         j->code_buffer <<= s;
-         j->code_bits -= s;
+         if (s > nb) {
+            *pcb = cb; *pnb = nb;
+            return stbi__err("bad huffman code", "Combined length longer than code bits available");
+         }
+         cb <<= s;
+         nb -= s;
          // decode into unzigzag'd location
          zig = stbi__jpeg_dezigzag[k++];
          data[zig] = (short) ((r >> 8) * dequant[zig]);
       } else {
-         int rs = stbi__jpeg_huff_decode(j, hac);
-         if (rs < 0) return stbi__err("bad huffman code","Corrupt JPEG");
+         int rs = stbi__jpeg_huff_decode_l(j, hac, &cb, &nb);
+         if (rs < 0) {
+            *pcb = cb; *pnb = nb;
+            return stbi__err("bad huffman code","Corrupt JPEG");
+         }
          s = rs & 15;
          r = rs >> 4;
          if (s == 0) {
@@ -2383,10 +2510,12 @@ static int stbi__jpeg_decode_block(stbi__jpeg *j, short data[64], stbi__huffman 
             k += r;
             // decode into unzigzag'd location
             zig = stbi__jpeg_dezigzag[k++];
-            data[zig] = (short) (stbi__extend_receive(j,s) * dequant[zig]);
+            data[zig] = (short) (stbi__extend_receive_l(j, s, &cb, &nb) * dequant[zig]);
          }
       }
    } while (k < 64);
+   *pcb = cb;
+   *pnb = nb;
    return 1;
 }
 
@@ -3608,6 +3737,10 @@ static int stbi__parse_entropy_coded_data(stbi__jpeg *z)
          int i,j;
          STBI_SIMD_ALIGN(short, data[64]);
          int n = z->order[0];
+         // bit state held in locals across the whole scan (jdhuff style),
+         // synced back to z only at restart markers and on exit
+         stbi__uint32 cb = z->code_buffer;
+         int nb = z->code_bits;
          // non-interleaved data, we just need to process one block at a time,
          // in trivial scanline order
          // number of blocks to do just depends on how many actual "pixels" this
@@ -3617,22 +3750,31 @@ static int stbi__parse_entropy_coded_data(stbi__jpeg *z)
          for (j=0; j < h; ++j) {
             for (i=0; i < w; ++i) {
                int ha = z->img_comp[n].ha;
-               if (!stbi__jpeg_decode_block(z, data, z->huff_dc+z->img_comp[n].hd, z->huff_ac+ha, z->fast_ac[ha], n, z->dequant[z->img_comp[n].tq])) return 0;
+               if (!stbi__jpeg_decode_block(z, data, z->huff_dc+z->img_comp[n].hd, z->huff_ac+ha, z->fast_ac[ha], n, z->dequant[z->img_comp[n].tq], &cb, &nb)) {
+                  z->code_buffer = cb; z->code_bits = nb;
+                  return 0;
+               }
                z->idct_block_kernel(z->img_comp[n].data+z->img_comp[n].w2*j*8+i*8, z->img_comp[n].w2, data);
                // every data block is an MCU, so countdown the restart interval
                if (--z->todo <= 0) {
+                  z->code_buffer = cb; z->code_bits = nb;
                   if (z->code_bits < 24) stbi__grow_buffer_unsafe(z);
                   // if it's NOT a restart, then just bail, so we get corrupt data
                   // rather than no data
                   if (!STBI__RESTART(z->marker)) return 1;
                   stbi__jpeg_reset(z);
+                  cb = z->code_buffer;
+                  nb = z->code_bits;
                }
             }
          }
+         z->code_buffer = cb; z->code_bits = nb;
          return 1;
       } else { // interleaved
          int i,j,k,x,y;
          STBI_SIMD_ALIGN(short, data[64]);
+         stbi__uint32 cb = z->code_buffer;
+         int nb = z->code_bits;
          for (j=0; j < z->img_mcu_y; ++j) {
             for (i=0; i < z->img_mcu_x; ++i) {
                // scan an interleaved mcu... process scan_n components in order
@@ -3645,7 +3787,10 @@ static int stbi__parse_entropy_coded_data(stbi__jpeg *z)
                         int x2 = (i*z->img_comp[n].h + x)*8;
                         int y2 = (j*z->img_comp[n].v + y)*8;
                         int ha = z->img_comp[n].ha;
-                        if (!stbi__jpeg_decode_block(z, data, z->huff_dc+z->img_comp[n].hd, z->huff_ac+ha, z->fast_ac[ha], n, z->dequant[z->img_comp[n].tq])) return 0;
+                        if (!stbi__jpeg_decode_block(z, data, z->huff_dc+z->img_comp[n].hd, z->huff_ac+ha, z->fast_ac[ha], n, z->dequant[z->img_comp[n].tq], &cb, &nb)) {
+                           z->code_buffer = cb; z->code_bits = nb;
+                           return 0;
+                        }
                         z->idct_block_kernel(z->img_comp[n].data+z->img_comp[n].w2*y2+x2, z->img_comp[n].w2, data);
                      }
                   }
@@ -3653,12 +3798,16 @@ static int stbi__parse_entropy_coded_data(stbi__jpeg *z)
                // after all interleaved components, that's an interleaved MCU,
                // so now count down the restart interval
                if (--z->todo <= 0) {
+                  z->code_buffer = cb; z->code_bits = nb;
                   if (z->code_bits < 24) stbi__grow_buffer_unsafe(z);
                   if (!STBI__RESTART(z->marker)) return 1;
                   stbi__jpeg_reset(z);
+                  cb = z->code_buffer;
+                  nb = z->code_bits;
                }
             }
          }
+         z->code_buffer = cb; z->code_bits = nb;
          return 1;
       }
    } else {
@@ -3801,6 +3950,8 @@ static int stbi__process_marker(stbi__jpeg *z, int m)
             }
             for (i=0; i < n; ++i)
                v[i] = stbi__get8(z->s);
+            // values are in: finish the merged fast entries
+            stbi__merge_huffman_fast(tc == 0 ? z->huff_dc+th : z->huff_ac+th);
             if (tc != 0)
                stbi__build_fast_ac(z->fast_ac[th], z->huff_ac + th);
             L -= n;

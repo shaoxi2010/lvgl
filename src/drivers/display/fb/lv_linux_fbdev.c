@@ -32,6 +32,15 @@
 #include "../../../draw/sw/lv_draw_sw.h"
 #include "../../../misc/lv_area_private.h"
 
+/* Async flush: hand each flush to a worker thread so FBIO_WAITFORVSYNC blocks
+ * it, not the app. Safe with one job slot: LVGL calls flush_wait_cb before the
+ * draw buffer is reused -- before every flush_cb (double-buffered) or before
+ * rendering the next area (single-buffered, lv_refr.c). pthread only. */
+#if LV_LINUX_FBDEV_VSYNC && LV_USE_OS == LV_OS_PTHREAD
+#define FBDEV_ASYNC_FLUSH 1
+#include "../../../osal/lv_os_private.h"
+#endif
+
 /*********************
  *      DEFINES
  *********************/
@@ -78,6 +87,17 @@ typedef struct {
     bool vsync_supported;
     bool skip_unblank;
     bool swap_rb;
+#if FBDEV_ASYNC_FLUSH
+    lv_thread_t flush_thread;
+    lv_thread_sync_t job_sync;      /* main -> worker: job slot filled */
+    lv_thread_sync_t done_sync;     /* worker -> main: copy completed */
+    lv_display_t * job_disp;
+    lv_area_t job_area;
+    uint8_t * job_src;
+    bool job_wait_vsync;            /* first flush of the frame: align to vblank */
+    bool flush_thread_started;
+    volatile bool flush_quit;
+#endif
 } lv_linux_fb_t;
 
 /**********************
@@ -86,6 +106,12 @@ typedef struct {
 
 static void del_event_cb(lv_event_t * e);
 static void flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * color_p);
+static void fbdev_do_flush(lv_linux_fb_t * dsc, lv_display_t * disp, const lv_area_t * area,
+                           uint8_t * color_p);
+#if FBDEV_ASYNC_FLUSH
+static void flush_thread_cb(void * p);
+static void flush_wait_cb(lv_display_t * disp);
+#endif
 static uint32_t tick_get_cb(void);
 static void swap_rb_line_16(uint8_t * dst, const uint8_t * src, int32_t pixel_count);
 static void swap_rb_line_24(uint8_t * dst, const uint8_t * src, int32_t pixel_count);
@@ -344,6 +370,21 @@ lv_result_t lv_linux_fbdev_set_file(lv_display_t * disp, const char * file)
     LV_LOG_INFO("Resolution is set to %" LV_PRId32 "x%" LV_PRId32 " at %" LV_PRId32 "dpi",
                 hor_res, ver_res, lv_display_get_dpi(disp));
 
+#if FBDEV_ASYNC_FLUSH
+    if(!dsc->flush_thread_started) {
+        lv_thread_sync_init(&dsc->job_sync);
+        lv_thread_sync_init(&dsc->done_sync);
+        if(lv_thread_init(&dsc->flush_thread, "fbdev-flush", LV_THREAD_PRIO_MID,
+                          flush_thread_cb, 32 * 1024, dsc) == LV_RESULT_OK) {
+            dsc->flush_thread_started = true;
+            lv_display_set_flush_wait_cb(disp, flush_wait_cb);
+        }
+        else {
+            LV_LOG_WARN("flush thread init failed; falling back to synchronous flush");
+        }
+    }
+#endif
+
     return LV_RESULT_OK;
 }
 
@@ -399,6 +440,18 @@ static void del_event_cb(lv_event_t * e)
     lv_linux_fb_t * dsc = lv_display_get_driver_data(disp);
     if(!dsc) return;
 
+#if FBDEV_ASYNC_FLUSH
+    if(dsc->flush_thread_started) {
+        dsc->flush_quit = true;
+        lv_thread_sync_signal(&dsc->job_sync);
+        lv_thread_delete(&dsc->flush_thread);    /* join: worker may be mid-copy
+                                                  * from the buffers freed below */
+        lv_thread_sync_delete(&dsc->job_sync);
+        lv_thread_sync_delete(&dsc->done_sync);
+        dsc->flush_thread_started = false;
+    }
+#endif
+
 #if LV_LINUX_FBDEV_MMAP
     if(MAP_FAILED != dsc->fbp) {
         munmap(dsc->fbp, dsc->screensize);
@@ -422,6 +475,7 @@ static void del_event_cb(lv_event_t * e)
 static void flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * color_p)
 {
     lv_linux_fb_t * dsc = lv_display_get_driver_data(disp);
+    if(dsc == NULL) return;
 
 #if LV_LINUX_FBDEV_MMAP
     if(dsc->fbp == NULL) {
@@ -430,8 +484,36 @@ static void flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * colo
     }
 #endif
 
+    /* Only the first flush of a frame aligns to vblank; the following copies
+     * race the scanout, like partial-mode strips always did. */
+    const bool is_last_flush = lv_display_flush_is_last(disp);
+    const bool wait_vsync_now = LV_LINUX_FBDEV_VSYNC && dsc->wait_vsync_next;
+    dsc->wait_vsync_next = is_last_flush;
+
+    /* FULL mode copies once per frame. Skipped flushes must not enqueue --
+     * flush_wait_cb would hang on a done signal that never comes. */
+    if(LV_LINUX_FBDEV_RENDER_MODE == LV_DISPLAY_RENDER_MODE_FULL && !is_last_flush) {
+        lv_display_flush_ready(disp);
+        return;
+    }
+
+#if FBDEV_ASYNC_FLUSH
+    /* Rotation reads disp->flushing_last in fbdev_do_flush, which only holds
+     * while the check runs on the main thread. */
+    if(dsc->flush_thread_started &&
+       lv_display_get_rotation(disp) == LV_DISPLAY_ROTATION_0) {
+        dsc->job_disp = disp;
+        dsc->job_area = *area;
+        dsc->job_src = color_p;
+        dsc->job_wait_vsync = wait_vsync_now;
+        lv_thread_sync_signal(&dsc->job_sync);
+        return;
+    }
+    /* worker unavailable or rotated: fall through to the synchronous path below */
+#endif
+
     /* Wait once per frame before drawing the next frame */
-    if(LV_LINUX_FBDEV_VSYNC && dsc->vsync_supported && dsc->wait_vsync_next) {
+    if(wait_vsync_now && dsc->vsync_supported) {
         uint32_t dummy = 0;
         if(ioctl(dsc->fbfd, FBIO_WAITFORVSYNC, &dummy) == -1) {
             /* Disable the optional wait if the framebuffer does not support FBIO_WAITFORVSYNC*/
@@ -440,18 +522,15 @@ static void flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * colo
         }
     }
 
+    fbdev_do_flush(dsc, disp, area, color_p);
 
-    const bool wait_for_last_flush = LV_LINUX_FBDEV_RENDER_MODE == LV_DISPLAY_RENDER_MODE_FULL;
-    const bool is_last_flush = lv_display_flush_is_last(disp);
-    const bool skip_flush = wait_for_last_flush && !is_last_flush;
-    /* wait for vsync every first frame*/
-    dsc->wait_vsync_next = is_last_flush;
+    lv_display_flush_ready(disp);
+}
 
-    if(skip_flush) {
-        lv_display_flush_ready(disp);
-        return;
-    }
-
+/* Copy only: vsync wait and flush_done signaling belong to the callers. */
+static void fbdev_do_flush(lv_linux_fb_t * dsc, lv_display_t * disp, const lv_area_t * area,
+                           uint8_t * color_p)
+{
     const lv_color_format_t cf = lv_display_get_color_format(disp);
     const uint32_t px_size = lv_color_format_get_size(cf);
 
@@ -468,9 +547,8 @@ static void flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * colo
          * To do that, we use the display's resolution and as the area
          *  we also grab the current draw buffer so that we can rotate the whole display */
         if(LV_LINUX_FBDEV_RENDER_MODE == LV_DISPLAY_RENDER_MODE_DIRECT) {
-            if(!is_last_flush) {
+            if(!lv_display_flush_is_last(disp)) {
                 /* We need to wait for the last flush when using direct render mode with rotation*/
-                lv_display_flush_ready(disp);
                 return;
             }
             lv_draw_buf_t * draw_buf = lv_display_get_buf_active(disp);
@@ -513,7 +591,6 @@ static void flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * colo
     lv_area_t clipped_area;
     if(!lv_area_intersect(&clipped_area, area, &display_area)) {
         /* No intersection at all, nothing to render */
-        lv_display_flush_ready(disp);
         return;
     }
 
@@ -585,9 +662,39 @@ static void flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * colo
             perror("Error setting var screen info");
         }
     }
-
-    lv_display_flush_ready(disp);
 }
+
+#if FBDEV_ASYNC_FLUSH
+/* Double-buffered: the app renders on while we wait. Single-buffered: no
+ * better than the sync wait, but no worse either. */
+static void flush_thread_cb(void * p)
+{
+    lv_linux_fb_t * dsc = p;
+
+    for(;;) {
+        lv_thread_sync_wait(&dsc->job_sync);
+        if(dsc->flush_quit) break;
+
+        if(dsc->job_wait_vsync && dsc->vsync_supported) {
+            uint32_t dummy = 0;
+            if(ioctl(dsc->fbfd, FBIO_WAITFORVSYNC, &dummy) == -1) {
+                LV_LOG_WARN("FBIO_WAITFORVSYNC unsupported (%s); disabling vsync wait",
+                            strerror(errno));
+                dsc->vsync_supported = false;
+            }
+        }
+        fbdev_do_flush(dsc, dsc->job_disp, &dsc->job_area, dsc->job_src);
+        lv_thread_sync_signal(&dsc->done_sync);
+    }
+}
+
+/* Runs in the LVGL thread when LVGL needs the flushed buffer back. */
+static void flush_wait_cb(lv_display_t * disp)
+{
+    lv_linux_fb_t * dsc = lv_display_get_driver_data(disp);
+    if(dsc && dsc->flush_thread_started) lv_thread_sync_wait(&dsc->done_sync);
+}
+#endif
 
 static uint32_t tick_get_cb(void)
 {

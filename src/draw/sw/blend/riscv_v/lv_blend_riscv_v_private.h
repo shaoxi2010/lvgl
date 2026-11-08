@@ -42,36 +42,44 @@ extern "C" {
  *  Compatible with compilers that don't support RVV 1.0 tuple types.
  **********************/
 
-/* RGB888: 3 channels (B,G,R) with stride=3 */
+/* Real segmented ops (unit-stride memory access); tuple create/extract is
+ * optimized away by GCC into register-group aliases. Replaces the old
+ * N x strided vlse8/vsse8 emulation, which the LSU executes per element. */
+
+/* RGB888: 3 channels (B,G,R) */
 #define LV_RVV_VLSEG3E8_U8M2(base, vl, v_b, v_g, v_r) \
     do { \
-        (v_b) = __riscv_vlse8_v_u8m2((base) + 0, 3, (vl)); \
-        (v_g) = __riscv_vlse8_v_u8m2((base) + 1, 3, (vl)); \
-        (v_r) = __riscv_vlse8_v_u8m2((base) + 2, 3, (vl)); \
+        vuint8m2x3_t _seg = __riscv_vlseg3e8_v_u8m2x3((base), (vl)); \
+        (v_b) = __riscv_vget_v_u8m2x3_u8m2(_seg, 0); \
+        (v_g) = __riscv_vget_v_u8m2x3_u8m2(_seg, 1); \
+        (v_r) = __riscv_vget_v_u8m2x3_u8m2(_seg, 2); \
     } while(0)
 
 #define LV_RVV_VSSEG3E8_U8M2(base, v_b, v_g, v_r, vl) \
     do { \
-        __riscv_vsse8_v_u8m2((base) + 0, 3, (v_b), (vl)); \
-        __riscv_vsse8_v_u8m2((base) + 1, 3, (v_g), (vl)); \
-        __riscv_vsse8_v_u8m2((base) + 2, 3, (v_r), (vl)); \
+        vuint8m2x3_t _seg = __riscv_vset_v_u8m2_u8m2x3(__riscv_vundefined_u8m2x3(), 0, (v_b)); \
+        _seg = __riscv_vset_v_u8m2_u8m2x3(_seg, 1, (v_g)); \
+        _seg = __riscv_vset_v_u8m2_u8m2x3(_seg, 2, (v_r)); \
+        __riscv_vsseg3e8_v_u8m2x3((base), _seg, (vl)); \
     } while(0)
 
-/* XRGB8888/ARGB8888: 4 channels (B,G,R,X) with stride=4 */
+/* XRGB8888/ARGB8888: 4 channels (B,G,R,X) */
 #define LV_RVV_VLSEG4E8_U8M2(base, vl, v_b, v_g, v_r, v_x) \
     do { \
-        (v_b) = __riscv_vlse8_v_u8m2((base) + 0, 4, (vl)); \
-        (v_g) = __riscv_vlse8_v_u8m2((base) + 1, 4, (vl)); \
-        (v_r) = __riscv_vlse8_v_u8m2((base) + 2, 4, (vl)); \
-        (v_x) = __riscv_vlse8_v_u8m2((base) + 3, 4, (vl)); \
+        vuint8m2x4_t _seg = __riscv_vlseg4e8_v_u8m2x4((base), (vl)); \
+        (v_b) = __riscv_vget_v_u8m2x4_u8m2(_seg, 0); \
+        (v_g) = __riscv_vget_v_u8m2x4_u8m2(_seg, 1); \
+        (v_r) = __riscv_vget_v_u8m2x4_u8m2(_seg, 2); \
+        (v_x) = __riscv_vget_v_u8m2x4_u8m2(_seg, 3); \
     } while(0)
 
 #define LV_RVV_VSSEG4E8_U8M2(base, v_b, v_g, v_r, v_x, vl) \
     do { \
-        __riscv_vsse8_v_u8m2((base) + 0, 4, (v_b), (vl)); \
-        __riscv_vsse8_v_u8m2((base) + 1, 4, (v_g), (vl)); \
-        __riscv_vsse8_v_u8m2((base) + 2, 4, (v_r), (vl)); \
-        __riscv_vsse8_v_u8m2((base) + 3, 4, (v_x), (vl)); \
+        vuint8m2x4_t _seg = __riscv_vset_v_u8m2_u8m2x4(__riscv_vundefined_u8m2x4(), 0, (v_b)); \
+        _seg = __riscv_vset_v_u8m2_u8m2x4(_seg, 1, (v_g)); \
+        _seg = __riscv_vset_v_u8m2_u8m2x4(_seg, 2, (v_r)); \
+        _seg = __riscv_vset_v_u8m2_u8m2x4(_seg, 3, (v_x)); \
+        __riscv_vsseg4e8_v_u8m2x4((base), _seg, (vl)); \
     } while(0)
 
 /**********************
@@ -385,39 +393,46 @@ do { \
 
 #define LV_RVV_LOAD_ARGB8888_U8M1(ptr, x, v_b, v_g, v_r, v_a, vl) \
     do { \
-        (v_b) = __riscv_vlse8_v_u8m1((ptr) + (x) * 4 + 0, 4, (vl)); \
-        (v_g) = __riscv_vlse8_v_u8m1((ptr) + (x) * 4 + 1, 4, (vl)); \
-        (v_r) = __riscv_vlse8_v_u8m1((ptr) + (x) * 4 + 2, 4, (vl)); \
-        (v_a) = __riscv_vlse8_v_u8m1((ptr) + (x) * 4 + 3, 4, (vl)); \
+        vuint8m1x4_t _seg = __riscv_vlseg4e8_v_u8m1x4((ptr) + (x) * 4, (vl)); \
+        (v_b) = __riscv_vget_v_u8m1x4_u8m1(_seg, 0); \
+        (v_g) = __riscv_vget_v_u8m1x4_u8m1(_seg, 1); \
+        (v_r) = __riscv_vget_v_u8m1x4_u8m1(_seg, 2); \
+        (v_a) = __riscv_vget_v_u8m1x4_u8m1(_seg, 3); \
     } while(0)
 
 #define LV_RVV_LOAD_RGB888_U8M1(ptr, x, v_b, v_g, v_r, vl) \
     do { \
-        (v_b) = __riscv_vlse8_v_u8m1((ptr) + (x) * 3 + 0, 3, (vl)); \
-        (v_g) = __riscv_vlse8_v_u8m1((ptr) + (x) * 3 + 1, 3, (vl)); \
-        (v_r) = __riscv_vlse8_v_u8m1((ptr) + (x) * 3 + 2, 3, (vl)); \
+        vuint8m1x3_t _seg = __riscv_vlseg3e8_v_u8m1x3((ptr) + (x) * 3, (vl)); \
+        (v_b) = __riscv_vget_v_u8m1x3_u8m1(_seg, 0); \
+        (v_g) = __riscv_vget_v_u8m1x3_u8m1(_seg, 1); \
+        (v_r) = __riscv_vget_v_u8m1x3_u8m1(_seg, 2); \
     } while(0)
 
+/* vlseg4e8 reads the unused X byte too: one unit-stride access beats three
+ * strided ones; the 4th lane is discarded by the compiler */
 #define LV_RVV_LOAD_XRGB8888_U8M1(ptr, x, v_b, v_g, v_r, vl) \
     do { \
-        (v_b) = __riscv_vlse8_v_u8m1((ptr) + (x) * 4 + 0, 4, (vl)); \
-        (v_g) = __riscv_vlse8_v_u8m1((ptr) + (x) * 4 + 1, 4, (vl)); \
-        (v_r) = __riscv_vlse8_v_u8m1((ptr) + (x) * 4 + 2, 4, (vl)); \
+        vuint8m1x4_t _seg = __riscv_vlseg4e8_v_u8m1x4((ptr) + (x) * 4, (vl)); \
+        (v_b) = __riscv_vget_v_u8m1x4_u8m1(_seg, 0); \
+        (v_g) = __riscv_vget_v_u8m1x4_u8m1(_seg, 1); \
+        (v_r) = __riscv_vget_v_u8m1x4_u8m1(_seg, 2); \
     } while(0)
 
 #define LV_RVV_STORE_RGB888_U8M1(ptr, x, v_b, v_g, v_r, vl) \
     do { \
-        __riscv_vsse8_v_u8m1((ptr) + (x) * 3 + 0, 3, (v_b), (vl)); \
-        __riscv_vsse8_v_u8m1((ptr) + (x) * 3 + 1, 3, (v_g), (vl)); \
-        __riscv_vsse8_v_u8m1((ptr) + (x) * 3 + 2, 3, (v_r), (vl)); \
+        vuint8m1x3_t _seg = __riscv_vset_v_u8m1_u8m1x3(__riscv_vundefined_u8m1x3(), 0, (v_b)); \
+        _seg = __riscv_vset_v_u8m1_u8m1x3(_seg, 1, (v_g)); \
+        _seg = __riscv_vset_v_u8m1_u8m1x3(_seg, 2, (v_r)); \
+        __riscv_vsseg3e8_v_u8m1x3((ptr) + (x) * 3, _seg, (vl)); \
     } while(0)
 
 #define LV_RVV_STORE_XRGB8888_U8M1(ptr, x, v_b, v_g, v_r, v_a, vl) \
     do { \
-        __riscv_vsse8_v_u8m1((ptr) + (x) * 4 + 0, 4, (v_b), (vl)); \
-        __riscv_vsse8_v_u8m1((ptr) + (x) * 4 + 1, 4, (v_g), (vl)); \
-        __riscv_vsse8_v_u8m1((ptr) + (x) * 4 + 2, 4, (v_r), (vl)); \
-        __riscv_vsse8_v_u8m1((ptr) + (x) * 4 + 3, 4, (v_a), (vl)); \
+        vuint8m1x4_t _seg = __riscv_vset_v_u8m1_u8m1x4(__riscv_vundefined_u8m1x4(), 0, (v_b)); \
+        _seg = __riscv_vset_v_u8m1_u8m1x4(_seg, 1, (v_g)); \
+        _seg = __riscv_vset_v_u8m1_u8m1x4(_seg, 2, (v_r)); \
+        _seg = __riscv_vset_v_u8m1_u8m1x4(_seg, 3, (v_a)); \
+        __riscv_vsseg4e8_v_u8m1x4((ptr) + (x) * 4, _seg, (vl)); \
     } while(0)
 
 /**********************
